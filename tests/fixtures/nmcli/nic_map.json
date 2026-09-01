@@ -1,0 +1,23 @@
+{
+  "arm1": {
+    "mac": "08:BF:B8:89:4F:3A",
+    "ifname": "enp36s0f0",
+    "profile_uuid": "11111111-aaaa-4aaa-8aaa-111111111111",
+    "arm_ip": "192.168.1.235",
+    "ts": 0.0
+  },
+  "arm2": {
+    "mac": "08:BF:B8:89:4F:3B",
+    "ifname": "enp36s0f1",
+    "profile_uuid": "bd3e7da6-cccc-4ccc-8ccc-333333333333",
+    "arm_ip": "192.168.2.235",
+    "ts": 0.0
+  },
+  "arm3": {
+    "mac": "00:E0:4C:68:3D:97",
+    "ifname": "enx00e04c683d97",
+    "profile_uuid": "6753457b-dddd-4ddd-8ddd-444444444444",
+    "arm_ip": "192.168.3.235",
+    "ts": 0.0
+  }
+}

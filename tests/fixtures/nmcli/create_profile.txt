@@ -1,0 +1,6 @@
+# find-or-create: no manual profile exists in arm4's subnet -> nmcli add
+# (route-inert: never-default yes, empty gateway, ipv6 disabled) + UUID readback.
+$ nmcli connection add type ethernet con-name apollo-arm4 ifname * connection.autoconnect no ipv4.method manual ipv4.addresses 10.0.4.12/24 ipv4.never-default yes ipv4.gateway "" ipv6.method disabled
+Connection 'apollo-arm4' (44444444-4444-4444-8444-444444444444) successfully added.
+$ nmcli -g connection.uuid connection show apollo-arm4
+44444444-4444-4444-8444-444444444444

@@ -1,0 +1,83 @@
+# Actual target-machine audit state (network-manager.md §2), 2026-09-01:
+# two profiles both named xarm7_1; gateway pollution on xarm7_1/xarm7_2
+# (xarm7_2's gateway is outside its own subnet); wifi + tailscale internet.
+$ nmcli -t -f DEVICE,TYPE,STATE,CONNECTION device status
+enp36s0f0:ethernet:connected:xarm7_1
+enp36s0f1:ethernet:disconnected:
+enx00e04c683d97:ethernet:unavailable:
+wlp38s0:wifi:connected:APOLLO Lab
+tailscale0:tun:connected:tailscale0
+lo:loopback:unmanaged:
+$ nmcli -g GENERAL.HWADDR device show enp36s0f0
+08\:BF\:B8\:89\:4F\:3A
+$ nmcli -g GENERAL.HWADDR device show enp36s0f1
+08\:BF\:B8\:89\:4F\:3B
+$ nmcli -g GENERAL.HWADDR device show enx00e04c683d97
+00\:E0\:4C\:68\:3D\:97
+$ nmcli -g GENERAL.HWADDR device show wlp38s0
+AA\:BB\:CC\:DD\:EE\:FF
+$ nmcli -g GENERAL.HWADDR device show tailscale0
+
+$ nmcli -g GENERAL.HWADDR device show lo
+00\:00\:00\:00\:00\:00
+$ nmcli -t -f NAME,UUID,TYPE,DEVICE connection show
+xarm7_1:11111111-aaaa-4aaa-8aaa-111111111111:802-3-ethernet:enp36s0f0
+xarm7_1:22222222-bbbb-4bbb-8bbb-222222222222:802-3-ethernet:
+xarm7_2:bd3e7da6-cccc-4ccc-8ccc-333333333333:802-3-ethernet:
+xarm7_3:6753457b-dddd-4ddd-8ddd-444444444444:802-3-ethernet:
+APOLLO Lab:99999999-eeee-4eee-8eee-555555555555:802-11-wireless:wlp38s0
+tailscale0:88888888-ffff-4fff-8fff-666666666666:tun:tailscale0
+$ nmcli -g connection.interface-name,connection.autoconnect,connection.autoconnect-priority,ipv4.method,ipv4.addresses,ipv4.gateway,ipv4.never-default,802-3-ethernet.mac-address connection show uuid 11111111-aaaa-4aaa-8aaa-111111111111
+enp36s0f0
+yes
+0
+manual
+192.168.1.12/24
+192.168.1.1
+no
+
+$ nmcli -g connection.interface-name,connection.autoconnect,connection.autoconnect-priority,ipv4.method,ipv4.addresses,ipv4.gateway,ipv4.never-default,802-3-ethernet.mac-address connection show uuid 22222222-bbbb-4bbb-8bbb-222222222222
+
+yes
+0
+manual
+192.168.1.11/24
+192.168.1.1
+no
+
+$ nmcli -g connection.interface-name,connection.autoconnect,connection.autoconnect-priority,ipv4.method,ipv4.addresses,ipv4.gateway,ipv4.never-default,802-3-ethernet.mac-address connection show uuid bd3e7da6-cccc-4ccc-8ccc-333333333333
+
+yes
+0
+manual
+192.168.2.12/24
+192.168.1.1
+no
+
+$ nmcli -g connection.interface-name,connection.autoconnect,connection.autoconnect-priority,ipv4.method,ipv4.addresses,ipv4.gateway,ipv4.never-default,802-3-ethernet.mac-address connection show uuid 6753457b-dddd-4ddd-8ddd-444444444444
+
+yes
+0
+manual
+192.168.3.12/24
+192.168.3.1
+no
+
+$ nmcli -g connection.interface-name,connection.autoconnect,connection.autoconnect-priority,ipv4.method,ipv4.addresses,ipv4.gateway,ipv4.never-default,802-3-ethernet.mac-address connection show uuid 99999999-eeee-4eee-8eee-555555555555
+
+yes
+0
+auto
+
+
+no
+
+$ nmcli -g connection.interface-name,connection.autoconnect,connection.autoconnect-priority,ipv4.method,ipv4.addresses,ipv4.gateway,ipv4.never-default,802-3-ethernet.mac-address connection show uuid 88888888-ffff-4fff-8fff-666666666666
+tailscale0
+yes
+0
+disabled
+
+
+no
+
