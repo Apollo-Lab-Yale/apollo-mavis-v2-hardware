@@ -16,7 +16,7 @@ from enum import Enum
 from typing import Any
 
 import numpy as np
-from apollo_xarm7_core import (
+from apollo_mavis_v2_core import (
     ArmConnectError,
     ArmIdentityError,
     ArmInterface,

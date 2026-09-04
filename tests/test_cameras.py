@@ -4,12 +4,12 @@ import time
 
 import numpy as np
 import pytest
-from apollo_xarm7_core import CameraInitError
-from apollo_xarm7_core.schemas import CameraConfig
+from apollo_mavis_v2_core import CameraInitError
+from apollo_mavis_v2_core.schemas import CameraConfig
 
-from apollo_xarm7_hardware.cameras import find_all_cameras, make_camera
-from apollo_xarm7_hardware.cameras.opencv_camera import OpenCVCamera
-from apollo_xarm7_hardware.cameras.realsense_camera import RealSenseCamera
+from apollo_mavis_v2_hardware.cameras import find_all_cameras, make_camera
+from apollo_mavis_v2_hardware.cameras.opencv_camera import OpenCVCamera
+from apollo_mavis_v2_hardware.cameras.realsense_camera import RealSenseCamera
 
 BGR_FRAME = np.zeros((4, 6, 3), dtype=np.uint8)
 BGR_FRAME[..., 0] = 10  # B

@@ -1,4 +1,4 @@
-"""netsetup CLI: python -m apollo_xarm7_hardware.netsetup <command>.
+"""netsetup CLI: python -m apollo_mavis_v2_hardware.netsetup <command>.
 
 Commands: verify | match | reconcile | install | status.
 ``reconcile`` prints the plan only; pass ``--apply`` to execute it.
@@ -34,14 +34,14 @@ def _parse_arm(spec: str) -> ArmNet:
 
 
 def _arms_from_config(path: str) -> list[ArmNet]:
-    from apollo_xarm7_core import load_workcell_config
+    from apollo_mavis_v2_core import load_workcell_config
 
     cfg = load_workcell_config(path)
     return [ArmNet(name=a.id, ip=a.ip) for a in cfg.arms if a.ip]
 
 
 def build_parser() -> argparse.ArgumentParser:
-    p = argparse.ArgumentParser(prog="python -m apollo_xarm7_hardware.netsetup")
+    p = argparse.ArgumentParser(prog="python -m apollo_mavis_v2_hardware.netsetup")
     p.add_argument("command", choices=["verify", "match", "reconcile", "install", "status"])
     p.add_argument("--arm", action="append", type=_parse_arm, default=[],
                    help="name=ip[/prefix][,host=IP]; repeatable")

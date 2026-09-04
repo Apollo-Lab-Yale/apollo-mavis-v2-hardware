@@ -2,8 +2,8 @@
 
 from fakes.fake_xarm_api import FakeXArmAPI
 
-from apollo_xarm7_hardware.backstops import apply_backstops
-from apollo_xarm7_hardware.config import XArmDriverConfig
+from apollo_mavis_v2_hardware.backstops import apply_backstops
+from apollo_mavis_v2_hardware.config import XArmDriverConfig
 
 
 def _cfg(**overrides) -> XArmDriverConfig:

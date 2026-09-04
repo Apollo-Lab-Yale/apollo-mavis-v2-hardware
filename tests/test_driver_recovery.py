@@ -7,13 +7,13 @@ import pytest
 from fakes.fake_xarm_api import FaultScript
 from test_driver_connect import make_driver, wait_until
 
-from apollo_xarm7_hardware.driver import ArmFaultedError, DriverPhase
-from apollo_xarm7_hardware.events import (
+from apollo_mavis_v2_hardware.driver import ArmFaultedError, DriverPhase
+from apollo_mavis_v2_hardware.events import (
     RecoveredEvent,
     ReseedEvent,
     StudioConflictWarning,
 )
-from apollo_xarm7_hardware.rail import RailPhase
+from apollo_mavis_v2_hardware.rail import RailPhase
 
 
 def collect_until(drv, predicate, timeout=5.0):

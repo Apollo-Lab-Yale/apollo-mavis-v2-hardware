@@ -1,8 +1,8 @@
-"""apollo-xarm7-hardware: real xArm7 drivers for the apollo-xarm7 stack.
+"""apollo-mavis-v2-hardware: real xArm7 drivers for the apollo-mavis-v2 stack.
 
 Implements core's ArmInterface/CameraInterface/WorkcellInterface over the
 xArm-Python-SDK (pinned 1.18.5), plus NetworkManager auto-matching (netsetup)
-and V4L2/RealSense camera backends. Depends only on apollo-xarm7-core.
+and V4L2/RealSense camera backends. Depends only on apollo-mavis-v2-core.
 """
 
 from . import units

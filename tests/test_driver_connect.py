@@ -4,7 +4,7 @@ import time
 
 import numpy as np
 import pytest
-from apollo_xarm7_core import (
+from apollo_mavis_v2_core import (
     ArmIdentityError,
     CommandError,
     GripperCommand,
@@ -13,8 +13,8 @@ from apollo_xarm7_core import (
 )
 from fakes.fake_xarm_api import FakeXArmAPI
 
-from apollo_xarm7_hardware.config import XArmDriverConfig
-from apollo_xarm7_hardware.driver import ArmFaultedError, DriverPhase, XArmDriver
+from apollo_mavis_v2_hardware.config import XArmDriverConfig
+from apollo_mavis_v2_hardware.driver import ArmFaultedError, DriverPhase, XArmDriver
 
 
 def make_driver(fake_kwargs=None, cfg_kwargs=None, connect=True):

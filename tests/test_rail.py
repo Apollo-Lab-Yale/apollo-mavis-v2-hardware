@@ -2,7 +2,7 @@
 
 from fakes.fake_xarm_api import FakeXArmAPI
 
-from apollo_xarm7_hardware.rail import RailController, RailPhase
+from apollo_mavis_v2_hardware.rail import RailController, RailPhase
 
 
 def test_absent_rail_registers_timeout() -> None:

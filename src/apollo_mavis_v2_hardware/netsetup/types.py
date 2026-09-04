@@ -6,7 +6,7 @@ import ipaddress
 from dataclasses import dataclass, field
 from typing import Literal
 
-from apollo_xarm7_core import ApolloError
+from apollo_mavis_v2_core import ApolloError
 
 ProbeResult = Literal["open", "refused", "unreachable"]
 
@@ -88,7 +88,7 @@ class MatchResult:
 
 @dataclass(frozen=True)
 class NicMapEntry:
-    """Persisted arm -> NIC binding (~/.config/apollo-xarm7/nic_map.json).
+    """Persisted arm -> NIC binding (~/.config/apollo-mavis-v2/nic_map.json).
 
     Keyed by MAC (stable); ifname is resolved at runtime (names drift)."""
 

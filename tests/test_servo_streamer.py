@@ -7,8 +7,8 @@ import pytest
 from conftest import FakeClock
 from fakes.fake_xarm_api import FakeXArmAPI
 
-from apollo_xarm7_hardware.config import ServoLimits
-from apollo_xarm7_hardware.driver import _ServoStreamer
+from apollo_mavis_v2_hardware.config import ServoLimits
+from apollo_mavis_v2_hardware.driver import _ServoStreamer
 
 DT = 0.01
 LIMITS = ServoLimits()  # vel 1.0 rad/s, acc 20 rad/s^2, cart step 9 mm

@@ -12,7 +12,7 @@ from abc import ABC, abstractmethod
 from collections.abc import Callable
 from typing import Any, ClassVar
 
-from apollo_xarm7_core import GripperCommand, GripperInitError, GripperState
+from apollo_mavis_v2_core import GripperCommand, GripperInitError, GripperState
 
 from . import units
 

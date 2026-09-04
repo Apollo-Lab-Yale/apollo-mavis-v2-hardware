@@ -7,13 +7,13 @@ import time
 from collections.abc import Callable
 from typing import Any, Literal
 
-from apollo_xarm7_core import (
+from apollo_mavis_v2_core import (
     ArmState,
     BringupError,
     WorkcellBringupError,
     WorkcellConfig,
 )
-from apollo_xarm7_core.interfaces import ArmInterface, CameraInterface, WorkcellInterface
+from apollo_mavis_v2_core.interfaces import ArmInterface, CameraInterface, WorkcellInterface
 from pydantic import BaseModel, Field
 
 from .cameras import make_camera

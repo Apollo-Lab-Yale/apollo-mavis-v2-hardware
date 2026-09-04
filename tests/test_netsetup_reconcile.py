@@ -4,10 +4,10 @@ import shutil
 
 from test_netsetup_match import make_sys_run
 
-from apollo_xarm7_hardware.netsetup import ArmNet, NetSetup, TranscriptRunner
-from apollo_xarm7_hardware.netsetup.__main__ import main as netsetup_main
-from apollo_xarm7_hardware.netsetup.nmcli import is_mutating
-from apollo_xarm7_hardware.netsetup.reconcile import apply_plan
+from apollo_mavis_v2_hardware.netsetup import ArmNet, NetSetup, TranscriptRunner
+from apollo_mavis_v2_hardware.netsetup.__main__ import main as netsetup_main
+from apollo_mavis_v2_hardware.netsetup.nmcli import is_mutating
+from apollo_mavis_v2_hardware.netsetup.reconcile import apply_plan
 
 ARMS = [
     ArmNet(name="arm1", ip="192.168.1.235"),
@@ -101,7 +101,7 @@ def test_apply_never_touches_profiles_carrying_sdk_traffic(tmp_path, nmcli_fixtu
 
 
 def test_cli_reconcile_plan_only_with_fixture_runner(tmp_path, nmcli_fixtures, capsys):
-    """python -m apollo_xarm7_hardware.netsetup reconcile (fixture-injected)."""
+    """python -m apollo_mavis_v2_hardware.netsetup reconcile (fixture-injected)."""
     shutil.copy(nmcli_fixtures / "nic_map.json", tmp_path / "nic_map.json")
     rc = netsetup_main(
         [

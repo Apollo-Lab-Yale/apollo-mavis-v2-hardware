@@ -3,13 +3,13 @@
 import time
 
 import pytest
-from apollo_xarm7_core import WorkcellBringupError
-from apollo_xarm7_core.schemas import ArmConfig, PoseModel, WorkcellConfig
+from apollo_mavis_v2_core import WorkcellBringupError
+from apollo_mavis_v2_core.schemas import ArmConfig, PoseModel, WorkcellConfig
 from fakes.fake_xarm_api import FakeXArmAPI
 
-from apollo_xarm7_hardware.driver import XArmDriver
-from apollo_xarm7_hardware.netsetup.types import MatchResult
-from apollo_xarm7_hardware.workcell import ArmBringupStatus, HardwareWorkcell
+from apollo_mavis_v2_hardware.driver import XArmDriver
+from apollo_mavis_v2_hardware.netsetup.types import MatchResult
+from apollo_mavis_v2_hardware.workcell import ArmBringupStatus, HardwareWorkcell
 
 
 def _wc_config(n_arms=2) -> WorkcellConfig:
@@ -117,7 +117,7 @@ class StubNetSetup:
 
 
 def test_booting_arm_polls_502_not_nics(monkeypatch):
-    import apollo_xarm7_hardware.workcell as workcell_mod
+    import apollo_mavis_v2_hardware.workcell as workcell_mod
 
     monkeypatch.setattr(workcell_mod, "BOOT_POLL_PERIOD_S", 0.01)  # fast test
     ns = StubNetSetup(probe="refused")  # ping OK, 502 refused: arm still booting

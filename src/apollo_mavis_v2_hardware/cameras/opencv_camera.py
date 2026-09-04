@@ -12,9 +12,9 @@ import threading
 import time
 from typing import Any
 
-from apollo_xarm7_core import CameraFrame, CameraInitError
-from apollo_xarm7_core.interfaces import CameraInterface
-from apollo_xarm7_core.schemas import CameraConfig
+from apollo_mavis_v2_core import CameraFrame, CameraInitError
+from apollo_mavis_v2_core.interfaces import CameraInterface
+from apollo_mavis_v2_core.schemas import CameraConfig
 
 try:  # optional dependency (heavy wheel; absent in slim test envs)
     import cv2 as _cv2

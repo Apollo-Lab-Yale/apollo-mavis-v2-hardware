@@ -15,9 +15,9 @@ from fakes.report_replayer import (
 )
 from test_driver_connect import wait_until
 
-from apollo_xarm7_hardware.config import XArmDriverConfig
-from apollo_xarm7_hardware.driver import XArmDriver
-from apollo_xarm7_hardware.events import StaleEvent
+from apollo_mavis_v2_hardware.config import XArmDriverConfig
+from apollo_mavis_v2_hardware.driver import XArmDriver
+from apollo_mavis_v2_hardware.events import StaleEvent
 
 
 def test_fixture_frames_parse() -> None:

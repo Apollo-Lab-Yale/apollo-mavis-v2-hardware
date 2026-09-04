@@ -41,7 +41,7 @@ sudo usermod -aG netdev $USER   # group exists on Ubuntu (gid 120); RE-LOGIN req
 ## 3. Verify
 
 ```bash
-uv run python -m apollo_xarm7_hardware.netsetup install --check
+uv run python -m apollo_mavis_v2_hardware.netsetup install --check
 ```
 
 `verify()` also runs this check at every session start, so a missing grant
@@ -50,7 +50,7 @@ failure. The guided path (prints these commands, asks confirmation, runs them
 via sudo) is:
 
 ```bash
-uv run python -m apollo_xarm7_hardware.netsetup install
+uv run python -m apollo_mavis_v2_hardware.netsetup install
 ```
 
 ## Notes

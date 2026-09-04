@@ -1,10 +1,10 @@
 """Gripper backends (02-hardware §4): classic pulses, G2 force, fw gates."""
 
-from apollo_xarm7_core import GripperCommand
+from apollo_mavis_v2_core import GripperCommand
 from conftest import FakeClock
 from fakes.fake_xarm_api import FakeXArmAPI
 
-from apollo_xarm7_hardware.grippers import (
+from apollo_mavis_v2_hardware.grippers import (
     ClassicGripper,
     G2Gripper,
     NoGripper,

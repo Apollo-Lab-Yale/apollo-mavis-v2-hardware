@@ -12,7 +12,7 @@ from __future__ import annotations
 from collections.abc import Sequence
 
 import numpy as np
-from apollo_xarm7_core import Pose, se3
+from apollo_mavis_v2_core import Pose, se3
 
 GRIPPER_PULSE_MAX = 850  # classic gripper pulses <-> 0.085 m opening span
 GRIPPER_G2_MM_MAX = 84.0  # G2 gripper opening, mm

@@ -4,17 +4,17 @@ import subprocess
 
 import pytest
 
-from apollo_xarm7_hardware.netsetup import ArmNet, NetSetup, TranscriptRunner
-from apollo_xarm7_hardware.netsetup.match import create_profile
-from apollo_xarm7_hardware.netsetup.nmcli import is_mutating
-from apollo_xarm7_hardware.netsetup.probe import (
+from apollo_mavis_v2_hardware.netsetup import ArmNet, NetSetup, TranscriptRunner
+from apollo_mavis_v2_hardware.netsetup.match import create_profile
+from apollo_mavis_v2_hardware.netsetup.nmcli import is_mutating
+from apollo_mavis_v2_hardware.netsetup.probe import (
     candidate_pool,
     denylist,
     internet_devices,
     list_nics,
 )
-from apollo_xarm7_hardware.netsetup.state import save_nic_map
-from apollo_xarm7_hardware.netsetup.types import NicMapEntry
+from apollo_mavis_v2_hardware.netsetup.state import save_nic_map
+from apollo_mavis_v2_hardware.netsetup.types import NicMapEntry
 
 ARM1 = ArmNet(name="arm1", ip="192.168.1.235")
 UUID1 = "11111111-aaaa-4aaa-8aaa-111111111111"
@@ -125,7 +125,7 @@ def test_match_persists_mac_keyed_state(tmp_path, nmcli_fixtures):
         ping_ok={"enp36s0f1"},
     )
     ns.match(reconcile_after=False)
-    from apollo_xarm7_hardware.netsetup.state import load_nic_map
+    from apollo_mavis_v2_hardware.netsetup.state import load_nic_map
 
     entry = load_nic_map(tmp_path / "nic_map.json")["arm1"]
     assert entry.mac == "08:BF:B8:89:4F:3B"  # MAC is the stable key
@@ -205,7 +205,7 @@ def test_ping_retried_at_least_three_times(tmp_path, nmcli_fixtures):
 
 
 def test_install_check_reports_missing_grant(tmp_path):
-    from apollo_xarm7_hardware.netsetup import install as install_mod
+    from apollo_mavis_v2_hardware.netsetup import install as install_mod
 
     problems = install_mod.check(
         run_sys=make_sys_run(), pkla_path=tmp_path / "nope.pkla"
@@ -220,7 +220,7 @@ def test_install_check_reports_missing_grant(tmp_path):
 
 def test_pkla_content_targets_local_authority() -> None:
     # Ubuntu 22.04 polkit 0.105: LocalAuthority only, JS .rules are IGNORED
-    from apollo_xarm7_hardware.netsetup.install import PKLA_CONTENT, PKLA_PATH
+    from apollo_mavis_v2_hardware.netsetup.install import PKLA_CONTENT, PKLA_PATH
 
     assert str(PKLA_PATH).startswith("/etc/polkit-1/localauthority/")
     assert str(PKLA_PATH).endswith(".pkla")

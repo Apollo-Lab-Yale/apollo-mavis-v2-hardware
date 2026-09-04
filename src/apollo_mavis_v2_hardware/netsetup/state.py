@@ -8,7 +8,7 @@ from pathlib import Path
 
 from .types import NicMapEntry
 
-DEFAULT_STATE_PATH = Path("~/.config/apollo-xarm7/nic_map.json")
+DEFAULT_STATE_PATH = Path("~/.config/apollo-mavis-v2/nic_map.json")
 
 
 def load_nic_map(path: Path = DEFAULT_STATE_PATH) -> dict[str, NicMapEntry]:

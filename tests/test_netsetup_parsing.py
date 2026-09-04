@@ -2,7 +2,7 @@
 
 import pytest
 
-from apollo_xarm7_hardware.netsetup.nmcli import (
+from apollo_mavis_v2_hardware.netsetup.nmcli import (
     TranscriptRunner,
     is_mutating,
     split_terse,

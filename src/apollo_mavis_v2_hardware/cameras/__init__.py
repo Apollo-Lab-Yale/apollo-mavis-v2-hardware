@@ -5,9 +5,9 @@ from __future__ import annotations
 
 from typing import Any
 
-from apollo_xarm7_core import CameraInitError
-from apollo_xarm7_core.interfaces import CameraInterface
-from apollo_xarm7_core.schemas import CameraConfig
+from apollo_mavis_v2_core import CameraInitError
+from apollo_mavis_v2_core.interfaces import CameraInterface
+from apollo_mavis_v2_core.schemas import CameraConfig
 
 from .opencv_camera import OpenCVCamera
 from .realsense_camera import RealSenseCamera

@@ -1,6 +1,6 @@
 """Intel RealSense camera backend (02-hardware §8), import-guarded.
 
-pyrealsense2 is an OPTIONAL extra (``pip install apollo-xarm7-hardware[realsense]``);
+pyrealsense2 is an OPTIONAL extra (``pip install apollo-mavis-v2-hardware[realsense]``);
 this module imports without it and raises CameraInitError on use. Tests inject
 a fake ``rs`` module via ``rs_mod``.
 """
@@ -12,9 +12,9 @@ import time
 from typing import Any
 
 import numpy as np
-from apollo_xarm7_core import CameraFrame, CameraInitError
-from apollo_xarm7_core.interfaces import CameraInterface
-from apollo_xarm7_core.schemas import CameraConfig
+from apollo_mavis_v2_core import CameraFrame, CameraInitError
+from apollo_mavis_v2_core.interfaces import CameraInterface
+from apollo_mavis_v2_core.schemas import CameraConfig
 
 try:  # optional [realsense] extra
     import pyrealsense2 as _rs
@@ -68,7 +68,7 @@ class RealSenseCamera(CameraInterface):
             raise CameraInitError(
                 "camera",
                 f"{self.cfg.id}: pyrealsense2 not installed "
-                "(pip install apollo-xarm7-hardware[realsense])",
+                "(pip install apollo-mavis-v2-hardware[realsense])",
             )
         try:
             self._pipeline = self._start_pipeline()

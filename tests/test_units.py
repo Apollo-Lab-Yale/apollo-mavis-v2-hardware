@@ -4,11 +4,11 @@ import math
 
 import numpy as np
 import pytest
-from apollo_xarm7_core import Pose, se3
+from apollo_mavis_v2_core import Pose, se3
 from hypothesis import given
 from hypothesis import strategies as st
 
-from apollo_xarm7_hardware import units
+from apollo_mavis_v2_hardware import units
 
 
 def test_one_meter_is_exactly_1000_mm() -> None:
