@@ -106,9 +106,12 @@ def main(argv: list[str] | None = None) -> int:
                 from .dispatcher import default_python, render_dispatcher
 
                 expected = render_dispatcher(args.python or default_python(), arms)
-            problems = install_mod.check(user=args.user, expected_script=expected)
+            notes: list[str] = []
+            problems = install_mod.check(user=args.user, expected_script=expected, notes=notes)
             for prob in problems:
                 print(f"PROBLEM: {prob}")
+            for note in notes:  # e.g. the .pkla dir is root-only -> not a problem, but say so
+                print(f"note: {note}")
             print("ok" if not problems else f"{len(problems)} problem(s)")
             return 0 if not problems else 1
         return install_mod.install(

@@ -1,5 +1,6 @@
 """verify()/match(): denylist, UUID addressing, serialized probing (§7.2)."""
 
+import os
 import subprocess
 
 import pytest
@@ -222,6 +223,33 @@ def test_install_check_reports_missing_grant(tmp_path):
     pkla.write_text(install_mod.PKLA_CONTENT)
     assert install_mod.check(run_sys=make_sys_run(), pkla_path=pkla,
                              dispatcher_path=hook) == []
+
+
+@pytest.mark.skipif(os.geteuid() == 0, reason="root ignores directory permissions")
+def test_install_check_unreadable_grant_is_a_note_not_a_problem(tmp_path):
+    """/etc/polkit-1/localauthority is root-only 0700: a non-root `install --check`
+    or verify() cannot read the .pkla even when it is present. With notes=[] that
+    is a note (healthy machine stays quiet); without it (install() under sudo, or
+    a mis-run without sudo) it stays a problem so the idempotent grant step re-runs."""
+    from apollo_mavis_v2_hardware.netsetup import install as install_mod
+
+    hook = tmp_path / "90-mavis-netsetup"
+    hook.write_text("#!/bin/bash\n")
+    hook.chmod(0o755)
+    locked = tmp_path / "localauthority"
+    locked.mkdir()
+    pkla = locked / "46-apollo-networkmanager.pkla"
+    pkla.write_text(install_mod.PKLA_CONTENT)
+    locked.chmod(0o000)
+    try:
+        notes: list[str] = []
+        assert install_mod.check(run_sys=make_sys_run(), pkla_path=pkla,
+                                 dispatcher_path=hook, notes=notes) == []
+        assert len(notes) == 1 and "not verified" in notes[0] and "sudo" in notes[0]
+        problems = install_mod.check(run_sys=make_sys_run(), pkla_path=pkla, dispatcher_path=hook)
+        assert len(problems) == 1 and "not verified" in problems[0]
+    finally:
+        locked.chmod(0o755)
 
 
 def test_pkla_content_targets_local_authority() -> None:

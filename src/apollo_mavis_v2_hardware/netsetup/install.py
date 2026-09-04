@@ -131,10 +131,19 @@ def check(
     user: str | None = None,
     dispatcher_path: Path = DISPATCHER_PATH,
     expected_script: str | None = None,
+    *,
+    notes: list[str] | None = None,
 ) -> list[str]:
     """Verify grant + group + dispatcher hook; returns problems (empty = healthy).
     verify() runs this so a missing piece becomes an actionable landing-page
-    warning, not a mid-bring-up failure."""
+    warning, not a mid-bring-up failure.
+
+    ``/etc/polkit-1/localauthority`` is root-only (0700 on Ubuntu 22.04), so a
+    non-root caller cannot see the .pkla at all -- present or not. When ``notes``
+    is given, that case is reported there ("not verified without root") instead
+    of as a problem: ``--check`` and verify() pass it so a healthy machine stays
+    quiet. install() does not, so an unverifiable grant is (idempotently)
+    re-written -- it runs under sudo anyway."""
     problems: list[str] = []
     try:
         content = pkla_path.read_text()
@@ -143,7 +152,9 @@ def check(
     except FileNotFoundError:
         problems.append(f"polkit grant missing: {pkla_path} (run: netsetup install)")
     except PermissionError:
-        problems.append(f"cannot read {pkla_path} (permissions)")
+        msg = (f"polkit grant not verified: {pkla_path} is under a root-only directory "
+               f"(run the check with sudo to cover it)")
+        (problems if notes is None else notes).append(msg)
     proc = run_sys(["id", "-nG"] + ([user] if user else []))
     groups = proc.stdout.split() if proc.returncode == 0 else []
     if NETDEV_GROUP not in groups and not (user is None and os.geteuid() == 0):

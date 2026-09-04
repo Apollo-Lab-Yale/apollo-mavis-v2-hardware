@@ -60,11 +60,15 @@ The script is rendered by `install` (venv python + arm list baked in); log:
 ```bash
 uv run python -m apollo_mavis_v2_hardware.netsetup install --check \
     --arm view=192.168.2.219 --arm grip=192.168.1.201
+# full check incl. the polkit grant: /etc/polkit-1/localauthority is root-only (0700),
+# so without sudo the .pkla is "not verified" (printed as a note, exit 0 if all else is fine)
+sudo /path/to/.venv/bin/python -m apollo_mavis_v2_hardware.netsetup install --check \
+    --arm view=192.168.2.219 --arm grip=192.168.1.201
 ```
 
 `verify()` also runs this check at every session start, so a missing grant or
 hook shows up as an actionable landing-page warning instead of a mid-bring-up
-failure. The guided path (prints every sudo command, asks confirmation, runs
+failure (the unreadable-as-user polkit dir is deliberately not one of them). The guided path (prints every sudo command, asks confirmation, runs
 them, then seeds the system nic_map) is:
 
 ```bash

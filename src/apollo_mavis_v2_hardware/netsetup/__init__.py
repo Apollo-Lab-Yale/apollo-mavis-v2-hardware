@@ -109,7 +109,8 @@ class NetSetup:
 
     def _health(self, nic_map: dict[str, NicMapEntry]) -> list[str]:
         """install artefacts + profile permissions (both actionable warnings)."""
-        problems = install_mod.check(self._run_sys)
+        # notes=[]: an unreadable (root-only) polkit dir is not a warning for the user
+        problems = install_mod.check(self._run_sys, notes=[])
         problems += match_mod.permission_problems(self.arms, nic_map, self._run)
         return problems
 
