@@ -63,10 +63,27 @@ class ProfileInfo:
     gateway: str = ""
     never_default: str = "no"
     mac_pin: str = ""  # 802-3-ethernet.mac-address
+    permissions: str = ""  # connection.permissions; "" = system-wide (every account)
 
     @property
     def active(self) -> bool:
         return bool(self.device)
+
+    @property
+    def user_restricted(self) -> bool:
+        """True when ``connection.permissions`` limits the profile to specific
+        users — other accounts (and the root dispatcher) cannot activate it."""
+        return bool(self.permissions.strip())
+
+
+MissReason = Literal[
+    "",  # ok
+    "no-mapping",  # nothing persisted for this arm (first run)
+    "nic-missing",  # stored MAC not present (NIC removed / renamed away)
+    "profile-inactive",  # stored NIC present but the stored profile is not active on it
+    "unreachable",  # profile active on the stored NIC, probe failed (booting? swapped?)
+    "no-candidate",  # match(): no NIC answered / no NIC left to try
+]
 
 
 @dataclass(frozen=True)
@@ -79,6 +96,7 @@ class MatchResult:
     profile_uuid: str
     probe: ProbeResult
     detail: str = ""
+    reason: MissReason = ""  # structured miss cause (drives repair(), §7.4)
 
     @property
     def ok(self) -> bool:

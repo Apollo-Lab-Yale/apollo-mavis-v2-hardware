@@ -1,0 +1,16 @@
+# repair() after the two arm cables were SWAPPED: both profiles auto-connected on
+# their pinned NICs but the wrong arm sits behind each. match() clears both pins,
+# probes serially (view: f0 fails -> release -> f1 answers; grip: only f0 left),
+# then reconcile re-pins each profile to its new NIC by name + MAC.
+$ nmcli connection modify uuid 6753457b-89fc-435a-a5a0-e94c728bc826 connection.interface-name "" 802-3-ethernet.mac-address ""
+$ nmcli -w 15 connection up uuid 6753457b-89fc-435a-a5a0-e94c728bc826 ifname enp36s0f0
+Connection successfully activated
+$ nmcli -w 10 connection down uuid 6753457b-89fc-435a-a5a0-e94c728bc826
+Connection successfully deactivated
+$ nmcli -w 15 connection up uuid 6753457b-89fc-435a-a5a0-e94c728bc826 ifname enp36s0f1
+Connection successfully activated
+$ nmcli connection modify uuid 5a4846b2-2383-4f3f-8871-ce71a8f7f303 connection.interface-name "" 802-3-ethernet.mac-address ""
+$ nmcli -w 15 connection up uuid 5a4846b2-2383-4f3f-8871-ce71a8f7f303 ifname enp36s0f0
+Connection successfully activated
+$ nmcli connection modify uuid 6753457b-89fc-435a-a5a0-e94c728bc826 connection.interface-name enp36s0f1 802-3-ethernet.mac-address 08:BF:B8:89:4F:3B
+$ nmcli connection modify uuid 5a4846b2-2383-4f3f-8871-ce71a8f7f303 connection.interface-name enp36s0f0 802-3-ethernet.mac-address 08:BF:B8:89:4F:3A

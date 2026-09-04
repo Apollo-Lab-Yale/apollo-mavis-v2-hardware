@@ -104,8 +104,10 @@ def test_match_probes_serially_and_releases_nics(tmp_path, nmcli_fixtures):
     assert run.calls.index(downs[0]) > run.calls.index(ups[0])
     assert run.calls.index(downs[0]) < run.calls.index(ups[1])
     # the pin was cleared before probing (ifname override would fail otherwise)
+    # BOTH pins are cleared: a MAC-pinned profile cannot activate on another NIC,
+    # so a cable swap could never be re-matched otherwise (reconcile re-pins)
     assert ("connection", "modify", "uuid", UUID1,
-            "connection.interface-name", "") in run.calls
+            "connection.interface-name", "", "802-3-ethernet.mac-address", "") in run.calls
 
 
 def test_match_never_mutates_denylisted_devices(tmp_path, nmcli_fixtures):
@@ -207,15 +209,19 @@ def test_ping_retried_at_least_three_times(tmp_path, nmcli_fixtures):
 def test_install_check_reports_missing_grant(tmp_path):
     from apollo_mavis_v2_hardware.netsetup import install as install_mod
 
+    hook = tmp_path / "90-mavis-netsetup"
+    hook.write_text("#!/bin/bash\n")
+    hook.chmod(0o755)
     problems = install_mod.check(
-        run_sys=make_sys_run(), pkla_path=tmp_path / "nope.pkla"
+        run_sys=make_sys_run(), pkla_path=tmp_path / "nope.pkla", dispatcher_path=hook
     )
     assert any("polkit grant missing" in p for p in problems)
-    # user IS in netdev per make_sys_run -> only the grant problem
+    # user IS in netdev per make_sys_run, hook present -> only the grant problem
     assert len(problems) == 1
     pkla = tmp_path / "46-apollo-networkmanager.pkla"
     pkla.write_text(install_mod.PKLA_CONTENT)
-    assert install_mod.check(run_sys=make_sys_run(), pkla_path=pkla) == []
+    assert install_mod.check(run_sys=make_sys_run(), pkla_path=pkla,
+                             dispatcher_path=hook) == []
 
 
 def test_pkla_content_targets_local_authority() -> None:
@@ -233,3 +239,54 @@ if __name__ == "__main__":
     import sys
 
     sys.exit(pytest.main([__file__, "-q"]))
+
+
+def test_verify_warns_when_profile_is_user_restricted(tmp_path, nmcli_fixtures):
+    _seed_state(tmp_path)
+    ns, _ = make_netsetup(
+        tmp_path, nmcli_fixtures,
+        ["machine_polluted.txt", "verify_extra.txt", "permissions_restricted.txt"],
+        ping_ok={"enp36s0f0"},
+    )
+    assert ns.verify()["arm1"].ok  # NM still activates it for THIS user...
+    warn = [p for p in ns.install_problems if "restricted" in p]
+    assert len(warn) == 1 and UUID1 in warn[0] and "user:xiatao" in warn[0]
+
+
+def test_verify_no_permissions_warning_for_system_wide_profile(tmp_path, nmcli_fixtures):
+    _seed_state(tmp_path)
+    ns, _ = make_netsetup(
+        tmp_path, nmcli_fixtures, ["machine_polluted.txt", "verify_extra.txt"],
+        ping_ok={"enp36s0f0"},
+    )
+    ns.verify()
+    assert not any("restricted" in p for p in ns.install_problems)
+
+
+def test_match_does_not_unpin_when_no_candidate_nic(tmp_path, nmcli_fixtures):
+    """No carrier anywhere (arm box off): keep the pins so NM autoconnect still
+    re-activates the profile when the cable comes back."""
+    run = TranscriptRunner.from_files(nmcli_fixtures / "machine_polluted.txt")
+    ns = NetSetup(
+        [ARM1], state_path=tmp_path / "nic_map.json", run=run, run_sys=make_sys_run(),
+        tcp_connect=lambda ip, port, timeout: "unreachable", carrier_of=lambda dev: False,
+    )
+    res = ns.match(reconcile_after=False)["arm1"]
+    assert not res.ok and res.reason == "no-candidate"
+    assert not any(is_mutating(c) for c in run.calls)
+
+
+def test_verify_results_carry_structured_miss_reasons(tmp_path, nmcli_fixtures):
+    ns, _ = make_netsetup(tmp_path, nmcli_fixtures, ["machine_polluted.txt"])
+    assert ns.verify()["arm1"].reason == "no-mapping"
+    save_nic_map(
+        {"arm1": NicMapEntry("AA:AA:AA:AA:AA:AA", "enp99", UUID1, "192.168.1.235")},
+        tmp_path / "nic_map.json",
+    )
+    assert ns.verify()["arm1"].reason == "nic-missing"
+    _seed_state(tmp_path)
+    ns, _ = make_netsetup(
+        tmp_path, nmcli_fixtures, ["machine_polluted.txt", "verify_extra.txt"],
+        ping_ok=frozenset(),
+    )
+    assert ns.verify()["arm1"].reason == "unreachable"

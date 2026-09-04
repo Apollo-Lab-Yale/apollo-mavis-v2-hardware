@@ -1,0 +1,12 @@
+# Overlay on machine_polluted.txt: xarm7_1 (UUID1) carries connection.permissions,
+# i.e. only one account may activate it -> other users / the root dispatcher cannot.
+$ nmcli -g connection.interface-name,connection.autoconnect,connection.autoconnect-priority,ipv4.method,ipv4.addresses,ipv4.gateway,ipv4.never-default,802-3-ethernet.mac-address,connection.permissions connection show uuid 11111111-aaaa-4aaa-8aaa-111111111111
+enp36s0f0
+yes
+0
+manual
+192.168.1.12/24
+192.168.1.1
+no
+
+user:xiatao:;

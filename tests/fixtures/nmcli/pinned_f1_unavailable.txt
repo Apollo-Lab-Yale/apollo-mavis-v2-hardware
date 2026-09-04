@@ -1,0 +1,14 @@
+# Overlay on machine_pinned.txt: the manipulation arm's cable is unplugged (or the
+# box is off) -> enp36s0f1 has no carrier, NM state unavailable, profile inactive.
+$ nmcli -t -f DEVICE,TYPE,STATE,CONNECTION device status
+enp36s0f0:ethernet:connected:mavis_viewpoint_arm
+enp36s0f1:ethernet:unavailable:
+enx00e04c683d97:ethernet:unavailable:
+wlp38s0:wifi:connected:APOLLO Lab
+lo:loopback:unmanaged:
+$ nmcli -g GENERAL.CON-UUID device show enp36s0f1
+
+$ nmcli -t -f NAME,UUID,TYPE,DEVICE connection show
+mavis_viewpoint_arm:6753457b-89fc-435a-a5a0-e94c728bc826:802-3-ethernet:enp36s0f0
+mavis_manipulation_arm:5a4846b2-2383-4f3f-8871-ce71a8f7f303:802-3-ethernet:
+APOLLO Lab:55307823-11f8-434f-8ff9-33d456178561:802-11-wireless:wlp38s0

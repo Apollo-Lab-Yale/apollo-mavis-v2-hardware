@@ -121,3 +121,57 @@ def test_cli_reconcile_plan_only_with_fixture_runner(tmp_path, nmcli_fixtures, c
     # proves no mutating nmcli command was executed without --apply
     assert UUID1 in out and UUID2 in out and UUID3 in out and UUID1_DUP in out
     assert "ipv4.gateway" in out and "802-3-ethernet.mac-address" in out
+
+
+def test_plan_without_mapping_disables_nothing(tmp_path, nmcli_fixtures):
+    """Live regression (2026-09-04): with no nic_map.json the old plan wanted to
+    disable BOTH working arm profiles as 'stale duplicates'. No mapping -> no
+    keeper -> nothing is a duplicate; --apply before match must be harmless."""
+    run = TranscriptRunner.from_files(nmcli_fixtures / "machine_polluted.txt")
+    ns = NetSetup(
+        ARMS, state_path=tmp_path / "absent.json", run=run, run_sys=make_sys_run(),
+        tcp_connect=lambda ip, port, timeout: "open", carrier_of=lambda dev: True,
+    )
+    plan = ns.reconcile(apply=False)
+    assert plan.steps == []
+    assert len(plan.skipped) == 3 and all("run match first" in s for s in plan.skipped)
+    for call in run.calls:
+        assert not is_mutating(call)
+
+
+def test_plan_partial_mapping_dedupes_only_mapped_subnets(tmp_path, nmcli_fixtures):
+    from apollo_mavis_v2_hardware.netsetup.state import save_nic_map
+    from apollo_mavis_v2_hardware.netsetup.types import NicMapEntry
+
+    save_nic_map(
+        {"arm1": NicMapEntry("08:BF:B8:89:4F:3A", "enp36s0f0", UUID1, "192.168.1.235")},
+        tmp_path / "nic_map.json",
+    )
+    run = TranscriptRunner.from_files(nmcli_fixtures / "machine_polluted.txt")
+    ns = NetSetup(
+        ARMS, state_path=tmp_path / "nic_map.json", run=run, run_sys=make_sys_run(),
+        tcp_connect=lambda ip, port, timeout: "open", carrier_of=lambda dev: True,
+    )
+    plan = ns.reconcile(apply=False)
+    assert _step_for(plan, UUID1) is not None  # mapped arm: pin + hygiene
+    assert _step_for(plan, UUID1_DUP) is not None  # its duplicate: disabled
+    assert _step_for(plan, UUID2) is None and _step_for(plan, UUID3) is None  # unmapped: kept
+    assert len(plan.steps) == 2
+
+
+def test_plan_clears_user_restricted_permissions(tmp_path, nmcli_fixtures):
+    """connection.permissions set -> only one account can activate the profile;
+    the root dispatcher and other users cannot. reconcile makes it system-wide."""
+    shutil.copy(nmcli_fixtures / "nic_map.json", tmp_path / "nic_map.json")
+    run = TranscriptRunner.from_files(nmcli_fixtures / "machine_polluted.txt",
+                                      nmcli_fixtures / "permissions_restricted.txt")
+    ns = NetSetup(
+        ARMS, state_path=tmp_path / "nic_map.json", run=run, run_sys=make_sys_run(),
+        tcp_connect=lambda ip, port, timeout: "open", carrier_of=lambda dev: True,
+    )
+    plan = ns.reconcile(apply=False)
+    args = list(_step_for(plan, UUID1).args)
+    assert args[args.index("connection.permissions") + 1] == ""
+    assert "system-wide" in _step_for(plan, UUID1).reason
+    # unrestricted profiles get no permissions arg
+    assert "connection.permissions" not in _step_for(plan, UUID2).args

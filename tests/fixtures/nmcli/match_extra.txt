@@ -1,6 +1,6 @@
 # match() flow additions over machine_polluted.txt: clear the interface-name
 # pin, then serialized candidate probing with release between attempts.
-$ nmcli connection modify uuid 11111111-aaaa-4aaa-8aaa-111111111111 connection.interface-name ""
+$ nmcli connection modify uuid 11111111-aaaa-4aaa-8aaa-111111111111 connection.interface-name "" 802-3-ethernet.mac-address ""
 $ nmcli -w 15 connection up uuid 11111111-aaaa-4aaa-8aaa-111111111111 ifname enp36s0f0
 Connection successfully activated
 $ nmcli -w 10 connection down uuid 11111111-aaaa-4aaa-8aaa-111111111111

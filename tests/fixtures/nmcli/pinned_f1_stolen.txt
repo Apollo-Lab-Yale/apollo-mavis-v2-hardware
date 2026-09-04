@@ -1,0 +1,32 @@
+# Overlay on machine_pinned.txt: a foreign profile (unitree_go2_1) grabbed enp36s0f1
+# and the manipulation arm does not answer anywhere. repair() re-activates the arm
+# profile on f1 (only non-frozen NIC), the probe fails, the NIC is released, and the
+# profile is put back where it was so NM autoconnect keeps working.
+$ nmcli -t -f DEVICE,TYPE,STATE,CONNECTION device status
+enp36s0f0:ethernet:connected:mavis_viewpoint_arm
+enp36s0f1:ethernet:connected:unitree_go2_1
+enx00e04c683d97:ethernet:unavailable:
+wlp38s0:wifi:connected:APOLLO Lab
+lo:loopback:unmanaged:
+$ nmcli -g GENERAL.CON-UUID device show enp36s0f1
+e7645dea-cd8f-4daa-8578-a382fd98c1c3
+$ nmcli -t -f NAME,UUID,TYPE,DEVICE connection show
+mavis_viewpoint_arm:6753457b-89fc-435a-a5a0-e94c728bc826:802-3-ethernet:enp36s0f0
+mavis_manipulation_arm:5a4846b2-2383-4f3f-8871-ce71a8f7f303:802-3-ethernet:
+unitree_go2_1:e7645dea-cd8f-4daa-8578-a382fd98c1c3:802-3-ethernet:enp36s0f1
+APOLLO Lab:55307823-11f8-434f-8ff9-33d456178561:802-11-wireless:wlp38s0
+$ nmcli -g connection.interface-name,connection.autoconnect,connection.autoconnect-priority,ipv4.method,ipv4.addresses,ipv4.gateway,ipv4.never-default,802-3-ethernet.mac-address,connection.permissions connection show uuid e7645dea-cd8f-4daa-8578-a382fd98c1c3
+
+yes
+0
+manual
+192.168.123.12/24
+
+no
+
+
+$ nmcli connection modify uuid 5a4846b2-2383-4f3f-8871-ce71a8f7f303 connection.interface-name "" 802-3-ethernet.mac-address ""
+$ nmcli -w 15 connection up uuid 5a4846b2-2383-4f3f-8871-ce71a8f7f303 ifname enp36s0f1
+Connection successfully activated
+$ nmcli -w 10 connection down uuid 5a4846b2-2383-4f3f-8871-ce71a8f7f303
+Connection successfully deactivated

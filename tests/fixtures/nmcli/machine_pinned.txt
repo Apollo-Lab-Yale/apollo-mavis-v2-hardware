@@ -1,0 +1,57 @@
+# Steady state after `netsetup install` on the MAVIS v2 cell (live UUIDs, 2026-09-04):
+# both arm profiles pinned by ifname + MAC, priority 50, route-inert, system-wide;
+# Wi-Fi is the internet NIC; USB dongle present without carrier.
+$ nmcli -t -f DEVICE,TYPE,STATE,CONNECTION device status
+enp36s0f0:ethernet:connected:mavis_viewpoint_arm
+enp36s0f1:ethernet:connected:mavis_manipulation_arm
+enx00e04c683d97:ethernet:unavailable:
+wlp38s0:wifi:connected:APOLLO Lab
+lo:loopback:unmanaged:
+$ nmcli -g GENERAL.HWADDR device show enp36s0f0
+08\:BF\:B8\:89\:4F\:3A
+$ nmcli -g GENERAL.HWADDR device show enp36s0f1
+08\:BF\:B8\:89\:4F\:3B
+$ nmcli -g GENERAL.HWADDR device show enx00e04c683d97
+00\:E0\:4C\:68\:3D\:97
+$ nmcli -g GENERAL.HWADDR device show wlp38s0
+AA\:BB\:CC\:DD\:EE\:FF
+$ nmcli -g GENERAL.HWADDR device show lo
+00\:00\:00\:00\:00\:00
+$ nmcli -g GENERAL.CON-UUID device show enp36s0f0
+6753457b-89fc-435a-a5a0-e94c728bc826
+$ nmcli -g GENERAL.CON-UUID device show enp36s0f1
+5a4846b2-2383-4f3f-8871-ce71a8f7f303
+$ nmcli -t -f NAME,UUID,TYPE,DEVICE connection show
+mavis_viewpoint_arm:6753457b-89fc-435a-a5a0-e94c728bc826:802-3-ethernet:enp36s0f0
+mavis_manipulation_arm:5a4846b2-2383-4f3f-8871-ce71a8f7f303:802-3-ethernet:enp36s0f1
+APOLLO Lab:55307823-11f8-434f-8ff9-33d456178561:802-11-wireless:wlp38s0
+$ nmcli -g connection.interface-name,connection.autoconnect,connection.autoconnect-priority,ipv4.method,ipv4.addresses,ipv4.gateway,ipv4.never-default,802-3-ethernet.mac-address,connection.permissions connection show uuid 6753457b-89fc-435a-a5a0-e94c728bc826
+enp36s0f0
+yes
+50
+manual
+192.168.2.12/24
+
+yes
+08\:BF\:B8\:89\:4F\:3A
+
+$ nmcli -g connection.interface-name,connection.autoconnect,connection.autoconnect-priority,ipv4.method,ipv4.addresses,ipv4.gateway,ipv4.never-default,802-3-ethernet.mac-address,connection.permissions connection show uuid 5a4846b2-2383-4f3f-8871-ce71a8f7f303
+enp36s0f1
+yes
+50
+manual
+192.168.1.11/24
+
+yes
+08\:BF\:B8\:89\:4F\:3B
+
+$ nmcli -g connection.interface-name,connection.autoconnect,connection.autoconnect-priority,ipv4.method,ipv4.addresses,ipv4.gateway,ipv4.never-default,802-3-ethernet.mac-address,connection.permissions connection show uuid 55307823-11f8-434f-8ff9-33d456178561
+wlp38s0
+yes
+0
+auto
+
+
+no
+
+

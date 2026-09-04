@@ -1,0 +1,16 @@
+{
+  "grip": {
+    "arm_ip": "192.168.1.201",
+    "ifname": "enp36s0f1",
+    "mac": "08:BF:B8:89:4F:3B",
+    "profile_uuid": "5a4846b2-2383-4f3f-8871-ce71a8f7f303",
+    "ts": 0.0
+  },
+  "view": {
+    "arm_ip": "192.168.2.219",
+    "ifname": "enp36s0f0",
+    "mac": "08:BF:B8:89:4F:3A",
+    "profile_uuid": "6753457b-89fc-435a-a5a0-e94c728bc826",
+    "ts": 0.0
+  }
+}

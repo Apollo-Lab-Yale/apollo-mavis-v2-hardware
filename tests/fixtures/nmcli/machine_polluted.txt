@@ -27,7 +27,7 @@ xarm7_2:bd3e7da6-cccc-4ccc-8ccc-333333333333:802-3-ethernet:
 xarm7_3:6753457b-dddd-4ddd-8ddd-444444444444:802-3-ethernet:
 APOLLO Lab:99999999-eeee-4eee-8eee-555555555555:802-11-wireless:wlp38s0
 tailscale0:88888888-ffff-4fff-8fff-666666666666:tun:tailscale0
-$ nmcli -g connection.interface-name,connection.autoconnect,connection.autoconnect-priority,ipv4.method,ipv4.addresses,ipv4.gateway,ipv4.never-default,802-3-ethernet.mac-address connection show uuid 11111111-aaaa-4aaa-8aaa-111111111111
+$ nmcli -g connection.interface-name,connection.autoconnect,connection.autoconnect-priority,ipv4.method,ipv4.addresses,ipv4.gateway,ipv4.never-default,802-3-ethernet.mac-address,connection.permissions connection show uuid 11111111-aaaa-4aaa-8aaa-111111111111
 enp36s0f0
 yes
 0
@@ -36,7 +36,7 @@ manual
 192.168.1.1
 no
 
-$ nmcli -g connection.interface-name,connection.autoconnect,connection.autoconnect-priority,ipv4.method,ipv4.addresses,ipv4.gateway,ipv4.never-default,802-3-ethernet.mac-address connection show uuid 22222222-bbbb-4bbb-8bbb-222222222222
+$ nmcli -g connection.interface-name,connection.autoconnect,connection.autoconnect-priority,ipv4.method,ipv4.addresses,ipv4.gateway,ipv4.never-default,802-3-ethernet.mac-address,connection.permissions connection show uuid 22222222-bbbb-4bbb-8bbb-222222222222
 
 yes
 0
@@ -45,7 +45,7 @@ manual
 192.168.1.1
 no
 
-$ nmcli -g connection.interface-name,connection.autoconnect,connection.autoconnect-priority,ipv4.method,ipv4.addresses,ipv4.gateway,ipv4.never-default,802-3-ethernet.mac-address connection show uuid bd3e7da6-cccc-4ccc-8ccc-333333333333
+$ nmcli -g connection.interface-name,connection.autoconnect,connection.autoconnect-priority,ipv4.method,ipv4.addresses,ipv4.gateway,ipv4.never-default,802-3-ethernet.mac-address,connection.permissions connection show uuid bd3e7da6-cccc-4ccc-8ccc-333333333333
 
 yes
 0
@@ -54,7 +54,7 @@ manual
 192.168.1.1
 no
 
-$ nmcli -g connection.interface-name,connection.autoconnect,connection.autoconnect-priority,ipv4.method,ipv4.addresses,ipv4.gateway,ipv4.never-default,802-3-ethernet.mac-address connection show uuid 6753457b-dddd-4ddd-8ddd-444444444444
+$ nmcli -g connection.interface-name,connection.autoconnect,connection.autoconnect-priority,ipv4.method,ipv4.addresses,ipv4.gateway,ipv4.never-default,802-3-ethernet.mac-address,connection.permissions connection show uuid 6753457b-dddd-4ddd-8ddd-444444444444
 
 yes
 0
@@ -63,7 +63,7 @@ manual
 192.168.3.1
 no
 
-$ nmcli -g connection.interface-name,connection.autoconnect,connection.autoconnect-priority,ipv4.method,ipv4.addresses,ipv4.gateway,ipv4.never-default,802-3-ethernet.mac-address connection show uuid 99999999-eeee-4eee-8eee-555555555555
+$ nmcli -g connection.interface-name,connection.autoconnect,connection.autoconnect-priority,ipv4.method,ipv4.addresses,ipv4.gateway,ipv4.never-default,802-3-ethernet.mac-address,connection.permissions connection show uuid 99999999-eeee-4eee-8eee-555555555555
 
 yes
 0
@@ -72,7 +72,7 @@ auto
 
 no
 
-$ nmcli -g connection.interface-name,connection.autoconnect,connection.autoconnect-priority,ipv4.method,ipv4.addresses,ipv4.gateway,ipv4.never-default,802-3-ethernet.mac-address connection show uuid 88888888-ffff-4fff-8fff-666666666666
+$ nmcli -g connection.interface-name,connection.autoconnect,connection.autoconnect-priority,ipv4.method,ipv4.addresses,ipv4.gateway,ipv4.never-default,802-3-ethernet.mac-address,connection.permissions connection show uuid 88888888-ffff-4fff-8fff-666666666666
 tailscale0
 yes
 0

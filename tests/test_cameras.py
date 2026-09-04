@@ -18,12 +18,13 @@ BGR_FRAME[..., 2] = 30  # R
 
 
 class FakeCapture:
-    def __init__(self, path, backend, honor=True, fps_clamp=None, fail_reads=False):
+    def __init__(self, path, backend, honor=True, fps_clamp=None, fail_reads=False, fixed=None):
         self.path = path
         self.backend = backend
         self.honor = honor
         self.fps_clamp = fps_clamp
         self.fail_reads = fail_reads
+        self.fixed = fixed or {}  # props the driver refuses to change (e.g. a depth node's Z16)
         self.props: dict[int, float] = {}
         self.set_order: list[int] = []
         self.released = False
@@ -33,7 +34,9 @@ class FakeCapture:
 
     def set(self, prop, value):
         self.set_order.append(prop)
-        if prop == FakeCv2.CAP_PROP_FPS and self.fps_clamp is not None:
+        if prop in self.fixed:
+            self.props[prop] = self.fixed[prop]
+        elif prop == FakeCv2.CAP_PROP_FPS and self.fps_clamp is not None:
             self.props[prop] = self.fps_clamp  # V4L2 silently clamps
         else:
             self.props[prop] = value
@@ -59,8 +62,9 @@ class FakeCv2:
     CAP_PROP_FRAME_HEIGHT = 4
     COLOR_BGR2RGB = 4
 
-    def __init__(self, **capture_kwargs):
+    def __init__(self, per_path=None, **capture_kwargs):
         self.capture_kwargs = capture_kwargs
+        self.per_path = per_path or {}  # path -> FakeCapture kwargs override
         self.captures: list[FakeCapture] = []
         self.num_threads: int | None = None
 
@@ -74,7 +78,7 @@ class FakeCv2:
         return code
 
     def VideoCapture(self, path, backend):
-        cap = FakeCapture(path, backend, **self.capture_kwargs)
+        cap = FakeCapture(path, backend, **{**self.capture_kwargs, **self.per_path.get(path, {})})
         self.captures.append(cap)
         return cap
 
@@ -85,9 +89,12 @@ class FakeCv2:
 
 def _cfg(cam_id="cam0", **kw) -> CameraConfig:
     return CameraConfig(
-        id=cam_id, kind="v4l2",
+        id=cam_id,
+        kind="v4l2",
         device_path="/dev/v4l/by-id/usb-FAKE_Cam_1234-video-index0",
-        resolution=(6, 4), fps=30, **kw,
+        resolution=(6, 4),
+        fps=30,
+        **kw,
     )
 
 
@@ -219,3 +226,96 @@ def test_make_camera_dispatch():
     assert isinstance(cam, OpenCVCamera)
     with pytest.raises(CameraInitError):
         make_camera(CameraConfig(id="s", kind="sim"))
+
+
+# -- USB-serial addressing (RealSense D435i colour over UVC) -----------------------------------
+D435I_SERIAL = "322143060792"
+
+
+def _fake_sysfs(tmp_path, serial=D435I_SERIAL):
+    """videoN/device -> <usb>:<iface> dir; <usb>/serial holds the USB serial.
+
+    Mirrors the lab machine: video0 = depth (interface 0), video1 = its metadata
+    node (index 1), video4 = colour (interface 3), video7 = another camera.
+    """
+    root = tmp_path / "video4linux"
+    root.mkdir()
+    usb = tmp_path / "devices" / "4-2"
+    usb.mkdir(parents=True)
+    (usb / "serial").write_text(serial + "\n")
+    other = tmp_path / "devices" / "6-2"
+    other.mkdir()
+    (other / "serial").write_text("999999999999\n")
+    for n, dev, iface, index in (
+        (4, usb, "03", 0),
+        (0, usb, "00", 0),
+        (1, usb, "00", 1),
+        (7, other, "00", 0),
+    ):
+        iface_dir = dev / f"{dev.name}:1.{int(iface)}"
+        iface_dir.mkdir(exist_ok=True)
+        (iface_dir / "bInterfaceNumber").write_text(iface + "\n")
+        node = root / f"video{n}"
+        node.mkdir()
+        (node / "index").write_text(f"{index}\n")
+        (node / "device").symlink_to(iface_dir)
+    return root
+
+
+def test_v4l2_nodes_by_usb_serial_orders_interfaces_and_skips_metadata(tmp_path):
+    from apollo_mavis_v2_hardware.cameras.opencv_camera import v4l2_nodes_by_usb_serial
+
+    root = _fake_sysfs(tmp_path)
+    assert v4l2_nodes_by_usb_serial(D435I_SERIAL, root) == ["/dev/video0", "/dev/video4"]
+    assert v4l2_nodes_by_usb_serial("999999999999", root) == ["/dev/video7"]
+    assert v4l2_nodes_by_usb_serial("nope", root) == []
+    assert v4l2_nodes_by_usb_serial(D435I_SERIAL, tmp_path / "missing") == []
+
+
+def _serial_cfg(**kw) -> CameraConfig:
+    base: dict = {
+        "id": "view_wrist",
+        "kind": "v4l2",
+        "serial": D435I_SERIAL,
+        "fourcc": "YUYV",
+        "resolution": (6, 4),
+        "fps": 30,
+    }
+    base.update(kw)
+    return CameraConfig(**base)
+
+
+def test_serial_config_tries_interfaces_until_fourcc_honored(tmp_path):
+    """The depth node keeps Z16 whatever we set -> skipped; the colour node wins."""
+    root = _fake_sysfs(tmp_path)
+    z16 = FakeCv2().VideoWriter_fourcc(*"Z16 ")
+    yuyv = FakeCv2().VideoWriter_fourcc(*"YUYV")
+    cv2 = FakeCv2(per_path={"/dev/video0": {"fixed": {FakeCv2.CAP_PROP_FOURCC: z16}}})
+    cam = OpenCVCamera(_serial_cfg(), cv2_mod=cv2, sysfs_root=root)
+    cam.start()
+    try:
+        assert cam.device_path == "/dev/video4"
+        assert [c.path for c in cv2.captures] == ["/dev/video0", "/dev/video4"]
+        assert cv2.captures[0].released  # the rejected depth node is released
+        assert cv2.captures[1].props[FakeCv2.CAP_PROP_FOURCC] == yuyv  # cfg.fourcc, not MJPG
+        time.sleep(0.05)
+        assert cam.latest() is not None
+    finally:
+        cam.stop()
+
+
+def test_serial_config_without_matching_node_raises(tmp_path):
+    root = _fake_sysfs(tmp_path)
+    cam = OpenCVCamera(_serial_cfg(serial="000000000000"), cv2_mod=FakeCv2(), sysfs_root=root)
+    with pytest.raises(CameraInitError, match="USB serial"):
+        cam.start()
+    z16 = FakeCv2().VideoWriter_fourcc(*"Z16 ")
+    cv2 = FakeCv2(fixed={FakeCv2.CAP_PROP_FOURCC: z16})  # every node refuses YUYV
+    with pytest.raises(CameraInitError, match="video0.*not honored.*video4.*not honored"):
+        OpenCVCamera(_serial_cfg(), cv2_mod=cv2, sysfs_root=root).start()
+    with pytest.raises(CameraInitError, match="device_path or serial"):
+        OpenCVCamera(
+            CameraConfig(id="c", kind="v4l2", device_path="/dev/video0").model_copy(
+                update={"device_path": None}
+            )
+        )

@@ -3,6 +3,14 @@
 cv2 is an OPTIONAL import: the module loads (and enumeration returns [])
 without it; opening a camera then raises CameraInitError. Tests inject a
 fake cv2 module via ``cv2_mod``.
+
+A camera is addressed by ``device_path`` (explicit node or a stable
+``/dev/v4l/by-path`` / ``by-id`` symlink) OR by USB ``serial``, resolved through
+sysfs at open time (:func:`v4l2_nodes_by_usb_serial`). The serial route exists
+for the MAVIS cell's RealSense D435i wrist cameras used as plain UVC colour
+cameras: a D435i exposes depth (interface 0) and colour (interface 3) as
+separate UVC interfaces that BOTH claim ``...-video-index0``, so udev keeps only
+one by-id symlink per name and the winner changes between plugs.
 """
 
 from __future__ import annotations
@@ -10,6 +18,7 @@ from __future__ import annotations
 import glob as _glob
 import threading
 import time
+from pathlib import Path
 from typing import Any
 
 from apollo_mavis_v2_core import CameraFrame, CameraInitError
@@ -24,20 +33,65 @@ except ImportError:  # pragma: no cover - exercised via cv2_mod injection
 BY_ID_GLOB = "/dev/v4l/by-id/*-video-index0"
 BY_PATH_GLOB = "/dev/v4l/by-path/*-video-index0"
 DEV_GLOB = "/dev/video*"
+SYSFS_V4L2 = "/sys/class/video4linux"
 MAX_CONSECUTIVE_FAILURES = 5
 STALE_AFTER_S = 0.5
 
 
-class OpenCVCamera(CameraInterface):
-    """One UVC camera opened by stable device PATH (never index)."""
+def _read_attr(path: Path) -> str | None:
+    try:
+        return path.read_text().strip()
+    except OSError:
+        return None
 
-    def __init__(self, cfg: CameraConfig, cv2_mod: Any = None) -> None:
+
+def v4l2_nodes_by_usb_serial(serial: str, sysfs_root: str | Path = SYSFS_V4L2) -> list[str]:
+    """``/dev/videoN`` capture nodes of the USB device with this ``serial``, one
+    per USB interface, ordered by interface number.
+
+    Walks ``<sysfs_root>/videoN``: ``device`` resolves to the USB interface
+    directory (``<bus>-<port>:1.<iface>``) whose parent holds the device's
+    ``serial`` attribute. Metadata nodes (``index != 0``) are skipped. For a
+    RealSense D435i this yields ``[depth node, colour node]``; the caller tries
+    them in order until one honours the requested pixel format.
+    """
+    found: list[tuple[int, int, str]] = []
+    for node in Path(sysfs_root).glob("video*"):
+        index = _read_attr(node / "index")
+        if index is not None and index != "0":
+            continue
+        try:
+            iface_dir = (node / "device").resolve()
+        except OSError:
+            continue
+        if _read_attr(iface_dir.parent / "serial") != serial:
+            continue
+        try:
+            iface_no = int(_read_attr(iface_dir / "bInterfaceNumber") or "0", 16)
+        except ValueError:
+            iface_no = 0
+        try:
+            node_no = int(node.name[len("video") :])
+        except ValueError:
+            continue
+        found.append((iface_no, node_no, f"/dev/{node.name}"))
+    return [path for _, _, path in sorted(found)]
+
+
+class OpenCVCamera(CameraInterface):
+    """One UVC camera opened by stable device PATH or USB serial (never index)."""
+
+    def __init__(
+        self, cfg: CameraConfig, cv2_mod: Any = None, sysfs_root: str | Path = SYSFS_V4L2
+    ) -> None:
         if cfg.kind != "v4l2":
             raise CameraInitError("camera", f"OpenCVCamera got kind={cfg.kind!r}")
-        if not cfg.device_path:
-            raise CameraInitError("camera", f"{cfg.id}: v4l2 camera needs device_path")
+        if not cfg.device_path and not cfg.serial:
+            raise CameraInitError("camera", f"{cfg.id}: v4l2 camera needs device_path or serial")
         self.cfg = cfg
         self._cv2 = cv2_mod if cv2_mod is not None else _cv2
+        self._sysfs_root = sysfs_root
+        self.device_path: str | None = cfg.device_path  # the node actually opened
         self._cap: Any = None
         self._thread: threading.Thread | None = None
         self._running = False
@@ -101,18 +155,41 @@ class OpenCVCamera(CameraInterface):
         return frame
 
     # -- internals ---------------------------------------------------------------
+    def _candidates(self) -> list[str]:
+        if self.cfg.device_path:
+            return [self.cfg.device_path]
+        nodes = v4l2_nodes_by_usb_serial(self.cfg.serial or "", self._sysfs_root)
+        if not nodes:
+            raise CameraInitError(
+                "camera", f"{self.cfg.id}: no V4L2 node with USB serial {self.cfg.serial!r}"
+            )
+        return nodes
+
     def _open_and_configure(self) -> Any:
+        """Open the first candidate node that honours the requested format."""
+        errors: list[str] = []
+        for path in self._candidates():
+            try:
+                cap = self._open_path(path)
+            except CameraInitError as exc:
+                errors.append(str(exc.args[-1]) if exc.args else str(exc))
+                continue
+            self.device_path = path
+            return cap
+        raise CameraInitError("camera", f"{self.cfg.id}: " + "; ".join(errors))
+
+    def _open_path(self, path: str) -> Any:
         cv2 = self._cv2
-        cap = cv2.VideoCapture(self.cfg.device_path, cv2.CAP_V4L2)
+        cap = cv2.VideoCapture(path, cv2.CAP_V4L2)
         if not cap.isOpened():
-            raise CameraInitError("camera", f"{self.cfg.id}: cannot open {self.cfg.device_path}")
+            raise CameraInitError("camera", f"{self.cfg.id}: cannot open {path}")
         w, h = self.cfg.resolution
-        fourcc = cv2.VideoWriter_fourcc(*"MJPG")
-        # order matters: FOURCC first (UVC reaches 30 fps at 640x480+ only in
-        # MJPG), then FPS, then W/H — verify every set() by read-back (V4L2
-        # silently clamps)
+        fourcc = cv2.VideoWriter_fourcc(*self.cfg.fourcc)
+        # order matters: FOURCC first (UVC webcams reach 30 fps at 640x480+ only
+        # in MJPG; a RealSense colour node is YUYV only), then FPS, then W/H —
+        # verify every set() by read-back (V4L2 silently clamps)
         for prop, value, label in (
-            (cv2.CAP_PROP_FOURCC, fourcc, "FOURCC=MJPG"),
+            (cv2.CAP_PROP_FOURCC, fourcc, f"FOURCC={self.cfg.fourcc}"),
             (cv2.CAP_PROP_FPS, float(self.cfg.fps), f"FPS={self.cfg.fps}"),
             (cv2.CAP_PROP_FRAME_WIDTH, float(w), f"WIDTH={w}"),
             (cv2.CAP_PROP_FRAME_HEIGHT, float(h), f"HEIGHT={h}"),
@@ -123,7 +200,7 @@ class OpenCVCamera(CameraInterface):
                 cap.release()
                 raise CameraInitError(
                     "camera",
-                    f"{self.cfg.id}: {label} not honored (got {actual})",
+                    f"{self.cfg.id}: {path}: {label} not honored (got {actual})",
                 )
         return cap
 
@@ -176,8 +253,10 @@ class OpenCVCamera(CameraInterface):
         opens but yields no frames.
         """
         cv2 = cv2_mod if cv2_mod is not None else _cv2
-        paths = sorted(glob_fn(BY_ID_GLOB)) or sorted(glob_fn(BY_PATH_GLOB)) or sorted(
-            glob_fn(DEV_GLOB)
+        paths = (
+            sorted(glob_fn(BY_ID_GLOB))
+            or sorted(glob_fn(BY_PATH_GLOB))
+            or sorted(glob_fn(DEV_GLOB))
         )
         found: list[dict[str, Any]] = []
         for path in paths:

@@ -3,7 +3,10 @@
 Plan first, execute only on ``apply=True``. NEVER touches a profile currently
 carrying SDK traffic (``active_uuids``) nor any denylisted device. Fixes the
 known pollution on the target machine: duplicate ``xarm7_1`` profiles,
-``ipv4.gateway`` entries creating a bogus default route, missing MAC pins.
+``ipv4.gateway`` entries creating a bogus default route, missing MAC pins,
+user-restricted ``connection.permissions``. Dedupe only happens inside the
+subnet of an arm that HAS a persisted mapping (otherwise nothing is known to
+be the keeper).
 """
 
 from __future__ import annotations
@@ -41,6 +44,9 @@ def _pin_args(profile: ProfileInfo, entry: NicMapEntry) -> tuple[list[str], list
         want("ipv4.gateway", "", "strip gateway pollution (bogus default route)")
     if profile.method != "manual":
         want("ipv4.method", "manual", "DHCP on an arm NIC hangs ~45 s per cycle")
+    if profile.user_restricted:
+        want("connection.permissions", "",
+             "system-wide profile: every account + the root dispatcher must use it")
     return args, reasons
 
 
@@ -82,13 +88,18 @@ def build_plan(
                 ["connection", "modify", "uuid", entry.profile_uuid, *args],
                 f"{arm.name}: " + "; ".join(reasons),
             )
-    # 2. disable stale/duplicate profiles inside any arm subnet
+    # 2. disable stale/duplicate profiles inside a MAPPED arm's subnet. Without a
+    #    mapping there is no "matched" profile to keep, so nothing is a duplicate:
+    #    an --apply before match must never knock out the working profiles.
+    mapped_arms = [a for a in arms if a.name in nic_map]
     for profile in profiles:
         if profile.uuid in matched_uuids:
             continue
         if profile.type not in ("802-3-ethernet", "ethernet"):
             continue
-        hit = next((a for a in arms if address_in_subnet(profile, a) is not None), None)
+        hit = next(
+            (a for a in mapped_arms if address_in_subnet(profile, a) is not None), None
+        )
         if hit is None:
             continue
         if profile.uuid in active_uuids:
