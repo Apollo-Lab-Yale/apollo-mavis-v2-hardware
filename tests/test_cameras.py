@@ -236,16 +236,19 @@ def _fake_sysfs(tmp_path, serial=D435I_SERIAL):
     """videoN/device -> <usb>:<iface> dir; <usb>/serial holds the USB serial.
 
     Mirrors the lab machine: video0 = depth (interface 0), video1 = its metadata
-    node (index 1), video4 = colour (interface 3), video7 = another camera.
+    node (index 1), video4 = colour (interface 3) of an Intel (8086) RealSense;
+    video7 = another vendor's camera.
     """
     root = tmp_path / "video4linux"
     root.mkdir()
     usb = tmp_path / "devices" / "4-2"
     usb.mkdir(parents=True)
     (usb / "serial").write_text(serial + "\n")
+    (usb / "idVendor").write_text("8086\n")
     other = tmp_path / "devices" / "6-2"
     other.mkdir()
     (other / "serial").write_text("999999999999\n")
+    (other / "idVendor").write_text("046d\n")
     for n, dev, iface, index in (
         (4, usb, "03", 0),
         (0, usb, "00", 0),
@@ -319,3 +322,74 @@ def test_serial_config_without_matching_node_raises(tmp_path):
                 update={"device_path": None}
             )
         )
+
+
+# -- RealSense cold-boot wake ----------------------------------------------------------------
+def test_usb_vendor_of_node_reads_sysfs(tmp_path):
+    from apollo_mavis_v2_hardware.cameras.opencv_camera import usb_vendor_of_node
+
+    root = _fake_sysfs(tmp_path)
+    assert usb_vendor_of_node("/dev/video4", root) == "8086"
+    assert usb_vendor_of_node("/dev/video7", root) == "046d"
+    assert usb_vendor_of_node("/dev/video99", root) is None
+
+
+def test_realsense_node_triggers_wake_once_non_realsense_does_not(tmp_path):
+    root = _fake_sysfs(tmp_path)
+    calls = []
+    z16 = FakeCv2().VideoWriter_fourcc(*"Z16 ")
+    cv2 = FakeCv2(per_path={"/dev/video0": {"fixed": {FakeCv2.CAP_PROP_FOURCC: z16}}})
+    # Two RealSense opens (depth rejected, colour accepted) -> the wake hook runs per
+    # open attempt here because the test hook has no once-per-process memory; the
+    # real hook (wake_realsense) keeps that state itself.
+    cam = OpenCVCamera(_serial_cfg(), cv2_mod=cv2, sysfs_root=root, rs_wake=lambda: calls.append(1))
+    cam.start()
+    try:
+        assert cam.device_path == "/dev/video4" and len(calls) == 2
+    finally:
+        cam.stop()
+    other = CameraConfig(id="c", kind="v4l2", serial="999999999999", resolution=(6, 4), fps=30)
+    calls.clear()
+    cam2 = OpenCVCamera(other, cv2_mod=FakeCv2(), sysfs_root=root, rs_wake=lambda: calls.append(1))
+    cam2.start()
+    try:
+        assert cam2.device_path == "/dev/video7" and calls == []  # Logitech: no wake
+    finally:
+        cam2.stop()
+
+
+def test_wake_realsense_runs_tool_once_and_tolerates_absence(monkeypatch):
+    from apollo_mavis_v2_hardware.cameras import opencv_camera as mod
+
+    monkeypatch.setattr(mod, "_rs_wake_done", False)
+    runs = []
+
+    class Proc:
+        returncode = 0
+        stdout = "RealSense D435I 243522071002 5.15.1"
+        stderr = ""
+
+    def runner(cmd, **kw):
+        runs.append((tuple(cmd), kw["timeout"]))
+        return Proc()
+
+    assert mod.wake_realsense(runner=runner) is True
+    assert mod.wake_realsense(runner=runner) is True  # cached: no second run
+    assert runs == [(("rs-enumerate-devices", "-s"), mod.RS_WAKE_TIMEOUT_S)]
+    assert mod.wake_realsense(runner=runner, force=True) is True and len(runs) == 2
+
+    monkeypatch.setattr(mod, "_rs_wake_done", False)
+
+    def missing(cmd, **kw):
+        raise FileNotFoundError(cmd[0])
+
+    assert mod.wake_realsense(runner=missing) is False
+    assert mod._rs_wake_done is True  # a missing tool is not retried for every camera
+
+    monkeypatch.setattr(mod, "_rs_wake_done", False)
+
+    class Bad(Proc):
+        returncode = 1
+        stderr = "No device detected"
+
+    assert mod.wake_realsense(runner=lambda cmd, **kw: Bad()) is False

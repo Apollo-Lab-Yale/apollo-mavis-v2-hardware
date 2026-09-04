@@ -11,11 +11,21 @@ for the MAVIS cell's RealSense D435i wrist cameras used as plain UVC colour
 cameras: a D435i exposes depth (interface 0) and colour (interface 3) as
 separate UVC interfaces that BOTH claim ``...-video-index0``, so udev keeps only
 one by-id symlink per name and the winner changes between plugs.
+
+RealSense cold-boot quirk (observed 2026-09-04, kernel 7.0.11, D435i firmware
+5.15.1 / 5.17.0.10): after a cold boot the colour UVC interface streams NOTHING
+(``select() timeout`` on every read) until librealsense has opened the device
+once. :func:`wake_realsense` runs ``rs-enumerate-devices -s`` (librealsense2-utils)
+once per process before the first RealSense node is opened; the tool queries and
+releases the devices in about a second and the colour stream works afterwards.
 """
 
 from __future__ import annotations
 
 import glob as _glob
+import logging
+import os
+import subprocess
 import threading
 import time
 from pathlib import Path
@@ -36,6 +46,13 @@ DEV_GLOB = "/dev/video*"
 SYSFS_V4L2 = "/sys/class/video4linux"
 MAX_CONSECUTIVE_FAILURES = 5
 STALE_AFTER_S = 0.5
+REALSENSE_USB_VENDOR = "8086"  # Intel; the D435i is 8086:0b3a
+RS_WAKE_CMD = ("rs-enumerate-devices", "-s")
+RS_WAKE_TIMEOUT_S = 30.0
+
+_log = logging.getLogger(__name__)
+_rs_wake_lock = threading.Lock()
+_rs_wake_done = False
 
 
 def _read_attr(path: Path) -> str | None:
@@ -78,11 +95,73 @@ def v4l2_nodes_by_usb_serial(serial: str, sysfs_root: str | Path = SYSFS_V4L2) -
     return [path for _, _, path in sorted(found)]
 
 
+def usb_vendor_of_node(path: str, sysfs_root: str | Path = SYSFS_V4L2) -> str | None:
+    """USB ``idVendor`` (hex string, e.g. ``"8086"``) of the device behind a
+    ``/dev/videoN`` node or a symlink to one; ``None`` when unknown / not USB."""
+    node = Path(sysfs_root) / Path(os.path.realpath(path)).name
+    try:
+        iface_dir = (node / "device").resolve()
+    except OSError:
+        return None
+    vendor = _read_attr(iface_dir.parent / "idVendor")
+    return vendor.lower() if vendor else None
+
+
+def wake_realsense(
+    runner: Any = subprocess.run,
+    timeout_s: float = RS_WAKE_TIMEOUT_S,
+    force: bool = False,
+) -> bool:
+    """Open-and-release every RealSense once through librealsense so the colour
+    UVC interfaces start streaming (cold-boot quirk, see the module docstring).
+
+    Runs ``rs-enumerate-devices -s`` at most once per process (``force`` repeats
+    it). Returns ``True`` when the tool ran and exited 0. A missing tool or a
+    failure is logged once and returns ``False`` -- the camera open then proceeds
+    and, on a cold-booted D435i, ends in ``failed`` (black tile) instead of
+    crashing anything.
+    """
+    global _rs_wake_done
+    with _rs_wake_lock:
+        if _rs_wake_done and not force:
+            return True
+        try:
+            proc = runner(
+                list(RS_WAKE_CMD), capture_output=True, text=True, timeout=timeout_s, check=False
+            )
+        except FileNotFoundError:
+            _log.warning(
+                "RealSense wake skipped: %s not found (install librealsense2-utils); "
+                "a cold-booted D435i colour stream may stay silent",
+                RS_WAKE_CMD[0],
+            )
+            _rs_wake_done = True  # do not retry on every camera
+            return False
+        except (subprocess.TimeoutExpired, OSError) as exc:
+            _log.warning("RealSense wake failed: %s", exc)
+            return False
+        _rs_wake_done = True
+        if proc.returncode != 0:
+            _log.warning(
+                "RealSense wake: %s exited %s: %s",
+                " ".join(RS_WAKE_CMD),
+                proc.returncode,
+                (proc.stderr or proc.stdout or "").strip()[:200],
+            )
+            return False
+        _log.info("RealSense wake: %s ok", " ".join(RS_WAKE_CMD))
+        return True
+
+
 class OpenCVCamera(CameraInterface):
     """One UVC camera opened by stable device PATH or USB serial (never index)."""
 
     def __init__(
-        self, cfg: CameraConfig, cv2_mod: Any = None, sysfs_root: str | Path = SYSFS_V4L2
+        self,
+        cfg: CameraConfig,
+        cv2_mod: Any = None,
+        sysfs_root: str | Path = SYSFS_V4L2,
+        rs_wake: Any = wake_realsense,
     ) -> None:
         if cfg.kind != "v4l2":
             raise CameraInitError("camera", f"OpenCVCamera got kind={cfg.kind!r}")
@@ -91,6 +170,7 @@ class OpenCVCamera(CameraInterface):
         self.cfg = cfg
         self._cv2 = cv2_mod if cv2_mod is not None else _cv2
         self._sysfs_root = sysfs_root
+        self._rs_wake = rs_wake  # tests inject a recorder; None disables the wake
         self.device_path: str | None = cfg.device_path  # the node actually opened
         self._cap: Any = None
         self._thread: threading.Thread | None = None
@@ -180,6 +260,10 @@ class OpenCVCamera(CameraInterface):
 
     def _open_path(self, path: str) -> Any:
         cv2 = self._cv2
+        if self._rs_wake is not None and (
+            usb_vendor_of_node(path, self._sysfs_root) == REALSENSE_USB_VENDOR
+        ):
+            self._rs_wake()  # once per process; a cold-booted D435i streams nothing before this
         cap = cv2.VideoCapture(path, cv2.CAP_V4L2)
         if not cap.isOpened():
             raise CameraInitError("camera", f"{self.cfg.id}: cannot open {path}")
