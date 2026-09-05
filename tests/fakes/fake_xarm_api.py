@@ -1,16 +1,26 @@
 """Stateful double of the XArmAPI surface the driver uses (02-hardware §11).
 
+Mirrors xarm-python-sdk 1.18.5 (the pinned rev), NOT a permissive stub:
+``register_report_callback`` accepts exactly the SDK keywords (no
+``report_mode``); the report payload carries the SDK keys only (no ``mode`` —
+``mode``/``state`` are attributes kept current by the "report thread", as the
+SDK does); ``version`` is the RAW controller string and ``version_number`` the
+parsed tuple; there is NO ``get_linear_track_sn``; ``do_not_open=True`` leaves
+the instance disconnected until ``connect()``.
+
 Encodes the SDK gotchas as behavior: errors reset mode to 0; servo sends
 return 1 (error latched) / 9 (not ready) / -8 (joint-limit reject);
 ``clean_error()`` alone is not readiness; unhomed rail returns 82; absent
-rail returns code 3; sim-mode controllers answer track calls with a bogus SN.
-Records ``sent_joints`` + a full ``calls`` log; ``emit_report`` (or the
-optional 30003 stream reader) fires registered report callbacks.
+rail returns code 3; a simulation-mode controller answers track reads with
+``(0, [])`` without touching the bus. Records ``sent_joints`` + a ``calls``
+log of every mutating call; ``emit_report`` (or the optional 30003 stream
+reader) fires registered report callbacks.
 """
 
 from __future__ import annotations
 
 import math
+import re
 import socket
 import threading
 import time
@@ -30,6 +40,9 @@ XARM7_LIMITS = [
     (-2 * math.pi, 2 * math.pi),
 ]
 
+# what the two lab boxes answer to get_version() (fw v1.12.10, 2026-09-04)
+REAL_VERSION_STRING = "7,7,XS1305,MC1303,v1.12.10"
+
 
 @dataclass
 class FaultScript:
@@ -42,7 +55,21 @@ class FaultScript:
 
 
 class FakeXArmAPI:
-    """Constructor mirrors XArmAPI(ip, is_radian=..., report_type=..., ...)."""
+    """Constructor mirrors XArmAPI(ip, is_radian=..., do_not_open=..., **kwargs)."""
+
+    # exact keyword surface of XArmAPI.register_report_callback in SDK 1.18.5
+    REPORT_CALLBACK_KEYWORDS = frozenset(
+        {
+            "report_cartesian",
+            "report_joints",
+            "report_state",
+            "report_error_code",
+            "report_warn_code",
+            "report_mtable",
+            "report_mtbrake",
+            "report_cmd_num",
+        }
+    )
 
     def __init__(
         self,
@@ -51,28 +78,42 @@ class FakeXArmAPI:
         do_not_open: bool = False,
         *,
         sn: str = "XA7-FAKE-0001",
-        version: str = "v2.6.107",
+        version: str = REAL_VERSION_STRING,
         initial_q: list[float] | None = None,
+        initial_tcp: list[float] | None = None,
         has_rail: bool = False,
         rail_homed: bool = False,
+        rail_enabled: bool = False,
         rail_sn: str = "AL1300FAKE1234",
+        simulation_robot: bool = False,
         gripper_fw: str = "3.4.3",
         fault_script: FaultScript | None = None,
         auto_report_hz: float = 0.0,
         report_stream: tuple[str, int] | None = None,
         motion_enable_fails: bool = False,
+        connect_fails: int = 0,
+        connect_delay_s: float = 0.0,
         clock: Callable[[], float] = time.monotonic,
         **kwargs: Any,
     ) -> None:
-        self.ctor_args = {"port": port, "is_radian": is_radian, **kwargs}
+        self.ctor_args = {
+            "port": port,
+            "is_radian": is_radian,
+            "do_not_open": do_not_open,
+            **kwargs,
+        }
         self.ip = port
         self.is_radian = is_radian
         self.check_joint_limit = kwargs.get("check_joint_limit", True)
         self.report_type = kwargs.get("report_type", "rich")
-        self.connected = True
+        self.connected = not do_not_open  # SDK: do_not_open -> connect() later
+        self.connect_failures_left = int(connect_fails)
+        # connect() blocks this long (real SDK: two sockets with their own timeouts +
+        # the version handshake -> seconds on a slow link); hand-over race tests
+        self.connect_delay_s = float(connect_delay_s)
         self.sn = sn
-        self.version = version
-        self.mode = 0
+        self.version = version  # RAW controller string, like the SDK property
+        self.mode = 0  # SDK: updated by the report thread, never in the payload
         self.state = 2  # sleeping/standby after a fresh connect
         self.error_code = 0
         self.warn_code = 0
@@ -80,8 +121,12 @@ class FakeXArmAPI:
         self.motion_enable_fails = motion_enable_fails
         self.joints_torque = [0.0] * 7
         self._q = list(initial_q) if initial_q is not None else [0.0] * 7
+        self._tcp = (
+            list(initial_tcp) if initial_tcp is not None else [207.0, 0.0, 112.0, math.pi, 0.0, 0.0]
+        )  # mm + rad, the SDK's get_position() units
         self._clock = clock
         self.fault_script = fault_script
+        self.simulation_robot = simulation_robot
         # recording
         self.calls: list[tuple[str, tuple, dict]] = []
         self.sent_joints: list[tuple[float, list[float]]] = []
@@ -94,14 +139,15 @@ class FakeXArmAPI:
         self._gripper_fw = gripper_fw
         # rail
         self._rail_present = has_rail
-        self._rail_sn = rail_sn
+        self._rail_sn = rail_sn  # kept for subclasses that add get_linear_track_sn
         self._rail_on_zero = 1 if rail_homed else 0
         self._rail_pos_mm = 0
-        self._rail_enabled = False
+        self._rail_enabled = bool(rail_enabled)
         self._rail_speed = 0
+        self._rail_error = 0
         self.rail_pos_commands: list[int] = []
         # report plumbing
-        self._callbacks: list[Callable[[dict], None]] = []
+        self._callbacks: list[tuple[Callable[[dict], None], dict[str, bool]]] = []
         self._auto_report_hz = auto_report_hz
         self._report_stream = report_stream
         self._report_threads_running = False
@@ -114,6 +160,15 @@ class FakeXArmAPI:
     def call_names(self) -> list[str]:
         return [name for name, _, _ in self.calls]
 
+    # -- identity ----------------------------------------------------------------
+    @property
+    def version_number(self) -> tuple[int, int, int]:
+        """SDK: (major, minor, revision) parsed from the raw version string."""
+        m = re.search(r"v?(\d+)\.(\d+)\.(\d+)\s*$", self.version)
+        if not m:
+            return (0, 0, 0)
+        return (int(m.group(1)), int(m.group(2)), int(m.group(3)))
+
     # -- error injection ---------------------------------------------------------
     def inject_error(self, code: int, warn: int = 0, drop_mode: bool = True) -> None:
         """Latch a controller error (e.g. 24 speed, 111 rail comms with
@@ -125,6 +180,17 @@ class FakeXArmAPI:
             self.state = 4
 
     # -- lifecycle / mode / state -------------------------------------------------
+    def connect(self, port: str | None = None, **kwargs: Any) -> None:
+        self._rec("connect")
+        if self.connected:
+            return  # SDK: connect() on a connected instance is a no-op
+        if self.connect_delay_s > 0:
+            time.sleep(self.connect_delay_s)
+        if self.connect_failures_left > 0:
+            self.connect_failures_left -= 1
+            raise Exception("connect socket failed")  # SDK raises bare Exception
+        self.connected = True
+
     def disconnect(self) -> None:
         self._rec("disconnect")
         self.connected = False
@@ -174,14 +240,23 @@ class FakeXArmAPI:
         self._rec("get_servo_angle", is_real=is_real)
         return 0, list(self._q)
 
+    def get_position(self, is_radian: Any = None) -> tuple[int, list[float]]:
+        """SDK: [x_mm, y_mm, z_mm, roll, pitch, yaw] (rad when is_radian)."""
+        return 0, list(self._tcp)
+
     def emergency_stop(self) -> None:
         self._rec("emergency_stop")
         self.state = 4
 
     # -- mode-1 servo streaming -----------------------------------------------------
     def set_servo_angle_j(
-        self, angles: list[float], speed: Any = None, mvacc: Any = None,
-        mvtime: Any = None, is_radian: Any = None, **kwargs: Any,
+        self,
+        angles: list[float],
+        speed: Any = None,
+        mvacc: Any = None,
+        mvtime: Any = None,
+        is_radian: Any = None,
+        **kwargs: Any,
     ) -> int:
         self.servo_calls += 1
         script = self.fault_script
@@ -252,12 +327,23 @@ class FakeXArmAPI:
         self._rec("set_gripper_speed", speed)
         return 0
 
-    def set_gripper_position(self, pos: int, wait: bool = False, **kwargs: Any) -> int:
-        self._rec("set_gripper_position", pos, wait=wait)
+    def set_gripper_position(
+        self,
+        pos: int,
+        wait: bool = False,
+        speed: Any = None,
+        auto_enable: bool = False,
+        timeout: Any = None,
+        **kwargs: Any,
+    ) -> int:
+        # SDK: wait_motion (default True) runs wait_move() before the modbus write
+        self._rec(
+            "set_gripper_position", pos, wait=wait, wait_motion=kwargs.get("wait_motion", True)
+        )
         self._gripper_pulse = int(pos)
         return 0
 
-    def get_gripper_position(self) -> tuple[int, int]:
+    def get_gripper_position(self, **kwargs: Any) -> tuple[int, int]:
         return 0, self._gripper_pulse
 
     def get_gripper_status(self) -> tuple[int, int]:
@@ -274,37 +360,52 @@ class FakeXArmAPI:
     def get_gripper_version(self) -> tuple[int, str]:
         return 0, self._gripper_fw
 
-    def set_external_device_monitor_params(self, dev_type: int = 1,
-                                           frequency: int = 10) -> int:
-        self._rec("set_external_device_monitor_params", dev_type=dev_type,
-                  frequency=frequency)
+    def set_external_device_monitor_params(self, dev_type: int = 1, frequency: int = 10) -> int:
+        self._rec("set_external_device_monitor_params", dev_type=dev_type, frequency=frequency)
         return 0
 
     # -- G2 gripper --------------------------------------------------------------------
-    def set_gripper_g2_position(self, pos: float, speed: int = 100, force: int = 50,
-                                wait: bool = False, **kwargs: Any) -> int:
-        self._rec("set_gripper_g2_position", pos, speed=speed, force=force, wait=wait)
+    def set_gripper_g2_position(
+        self,
+        pos: float,
+        speed: int = 100,
+        force: int = 50,
+        wait: bool = False,
+        timeout: Any = None,
+        **kwargs: Any,
+    ) -> int:
+        # SDK: wait_motion (default True) runs wait_move() before the modbus write
+        self._rec(
+            "set_gripper_g2_position",
+            pos,
+            speed=speed,
+            force=force,
+            wait=wait,
+            wait_motion=kwargs.get("wait_motion", True),
+        )
         self._g2_mm = float(pos)
         return 0
 
-    def get_gripper_g2_position(self) -> tuple[int, float]:
-        return 0, self._g2_mm
+    def get_gripper_g2_position(self, **kwargs: Any) -> tuple[int, int]:
+        return 0, int(self._g2_mm)  # SDK returns int mm
 
     # -- linear track (rail) --------------------------------------------------------------
-    def get_linear_track_registers(self, **kwargs: Any) -> tuple[int, dict]:
+    # NOTE: no get_linear_track_sn / get_linear_track_version — SDK 1.18.5 has none.
+    def get_linear_track_registers(self, **kwargs: Any) -> tuple[int, Any]:
         self._rec("get_linear_track_registers")
+        if self.simulation_robot:
+            return 0, []  # @xarm_is_not_simulation_mode(ret=(0, [])): bus untouched
         if not self._rail_present:
             return 3, {}  # response timeout: nothing on the RS-485 bus
         return 0, {
-            "pos": self._rail_pos_mm, "status": 0, "error": 0,
-            "is_enabled": int(self._rail_enabled), "on_zero": self._rail_on_zero,
+            "pos": self._rail_pos_mm,
+            "status": 0 if self._rail_on_zero else 2,
+            "error": self._rail_error,
+            "is_enabled": int(self._rail_enabled),
+            "on_zero": self._rail_on_zero,
+            "sci": 1,
+            "sco": [0, 0],
         }
-
-    def get_linear_track_sn(self) -> tuple[int, str]:
-        self._rec("get_linear_track_sn")
-        if not self._rail_present:
-            return 3, ""
-        return 0, self._rail_sn
 
     def get_linear_track_on_zero(self) -> tuple[int, int]:
         return 0, self._rail_on_zero
@@ -341,43 +442,93 @@ class FakeXArmAPI:
         return 0
 
     # -- report stream -----------------------------------------------------------------------
-    def register_report_callback(self, callback: Callable[[dict], None] = None,
-                                 **kwargs: Any) -> bool:
-        self._rec("register_report_callback")
+    def register_report_callback(
+        self,
+        callback: Callable[[dict], None] | None = None,
+        report_cartesian: bool = True,
+        report_joints: bool = True,
+        report_state: bool = True,
+        report_error_code: bool = True,
+        report_warn_code: bool = True,
+        report_mtable: bool = True,
+        report_mtbrake: bool = True,
+        report_cmd_num: bool = True,
+    ) -> bool:
+        """Exact SDK 1.18.5 signature: an unknown keyword (e.g. ``report_mode``)
+        is a TypeError here just as on the real ``XArmAPI``."""
+        flags = {
+            "report_cartesian": report_cartesian,
+            "report_joints": report_joints,
+            "report_state": report_state,
+            "report_error_code": report_error_code,
+            "report_warn_code": report_warn_code,
+            "report_mtable": report_mtable,
+            "report_mtbrake": report_mtbrake,
+            "report_cmd_num": report_cmd_num,
+        }
+        self._rec("register_report_callback", **flags)
         if callback is not None:
-            self._callbacks.append(callback)
+            self._callbacks.append((callback, flags))
         if not self._report_threads_running:
             self._report_threads_running = True
             if self._report_stream is not None:
-                t = threading.Thread(target=self._stream_reader, daemon=True,
-                                     name="fake-report-stream")
+                t = threading.Thread(
+                    target=self._stream_reader, daemon=True, name="fake-report-stream"
+                )
                 t.start()
                 self._threads.append(t)
             elif self._auto_report_hz > 0:
-                t = threading.Thread(target=self._auto_report, daemon=True,
-                                     name="fake-report-auto")
+                t = threading.Thread(target=self._auto_report, daemon=True, name="fake-report-auto")
                 t.start()
                 self._threads.append(t)
             else:
                 self.emit_report()  # SDK's report thread pushes immediately
         return True
 
-    def emit_report(self, q: list[float] | None = None, tcp: list[float] | None = None,
-                    tau: list[float] | None = None, mode: int | None = None,
-                    state: int | None = None, cmdnum: int = 0) -> None:
+    def _fire_report(self, joints: list[float], cartesian: list[float], cmdnum: int) -> None:
+        """Build the payload exactly like SDK ``_report_callback`` (no ``mode`` key)."""
+        for cb, flags in list(self._callbacks):
+            data: dict[str, Any] = {}
+            if flags["report_cartesian"]:
+                data["cartesian"] = list(cartesian)
+            if flags["report_joints"]:
+                data["joints"] = list(joints)
+            if flags["report_error_code"]:
+                data["error_code"] = self.error_code
+            if flags["report_warn_code"]:
+                data["warn_code"] = self.warn_code
+            if flags["report_state"]:
+                data["state"] = self.state
+            if flags["report_mtable"]:
+                data["mtable"] = [True] * 7
+            if flags["report_mtbrake"]:
+                data["mtbrake"] = [True] * 7
+            if flags["report_cmd_num"]:
+                data["cmdnum"] = cmdnum
+            cb(data)
+
+    def emit_report(
+        self,
+        q: list[float] | None = None,
+        tcp: list[float] | None = None,
+        tau: list[float] | None = None,
+        mode: int | None = None,
+        state: int | None = None,
+        cmdnum: int = 0,
+    ) -> None:
+        """Push one report; ``mode``/``state`` update the attributes (as the SDK
+        report thread does) — they are NOT part of the payload."""
         if tau is not None:
             self.joints_torque = list(tau)
-        data = {
-            "joints": list(q) if q is not None else list(self._q),
-            "cartesian": list(tcp) if tcp is not None else [0.0] * 6,
-            "mode": self.mode if mode is None else mode,
-            "state": self.state if state is None else state,
-            "cmdnum": cmdnum,
-            "error_code": self.error_code,
-            "warn_code": self.warn_code,
-        }
-        for cb in list(self._callbacks):
-            cb(data)
+        if mode is not None:
+            self.mode = mode
+        if state is not None:
+            self.state = state
+        self._fire_report(
+            list(q) if q is not None else list(self._q),
+            list(tcp) if tcp is not None else [0.0] * 6,
+            cmdnum,
+        )
 
     def _auto_report(self) -> None:
         period = 1.0 / self._auto_report_hz
@@ -387,7 +538,8 @@ class FakeXArmAPI:
 
     def _stream_reader(self) -> None:
         """Faithful stand-in for the SDK report thread: reads the 30003 byte
-        stream (here: the test replayer), parses frames, fires callbacks."""
+        stream (here: the test replayer), parses frames, updates the cached
+        mode/state/torque like ``__handle_report_real``, fires callbacks."""
         try:
             sock = socket.create_connection(self._report_stream, timeout=2.0)
         except OSError:
@@ -406,17 +558,9 @@ class FakeXArmAPI:
             for frame in splitter.feed(data):
                 parsed = parse_real_frame(frame)
                 self.joints_torque = parsed["torques"]
-                report = {
-                    "joints": parsed["joints"],
-                    "cartesian": parsed["cartesian"],
-                    "mode": parsed["mode"],
-                    "state": parsed["state"],
-                    "cmdnum": parsed["cmdnum"],
-                    "error_code": self.error_code,
-                    "warn_code": self.warn_code,
-                }
-                for cb in list(self._callbacks):
-                    cb(report)
+                self.mode = parsed["mode"]
+                self.state = parsed["state"]
+                self._fire_report(parsed["joints"], parsed["cartesian"], parsed["cmdnum"])
         try:
             sock.close()
         except OSError:

@@ -5,6 +5,16 @@ from fakes.fake_xarm_api import FakeXArmAPI
 from apollo_mavis_v2_hardware.rail import RailController, RailPhase
 
 
+class FakeWithTrackSn(FakeXArmAPI):
+    """A hypothetical SDK that DOES expose get_linear_track_sn (1.18.5 does not)."""
+
+    def get_linear_track_sn(self) -> tuple[int, str]:
+        self._rec("get_linear_track_sn")
+        if not self._rail_present:
+            return 3, ""
+        return 0, self._rail_sn
+
+
 def test_absent_rail_registers_timeout() -> None:
     api = FakeXArmAPI(has_rail=False)  # nothing on the RS-485 bus -> code 3
     rail = RailController(api)
@@ -12,21 +22,33 @@ def test_absent_rail_registers_timeout() -> None:
     assert rail.phase is RailPhase.ABSENT
 
 
-def test_sim_mode_bogus_sn_means_absent() -> None:
-    # sim-mode controllers silently no-op track calls (registers code 0!)
-    # but the SN is not a real AL13x track
-    api = FakeXArmAPI(has_rail=True, rail_sn="")
+def test_sdk_1_18_5_has_no_track_sn_api_detect_by_registers_with_warning() -> None:
+    api = FakeXArmAPI(has_rail=True)
+    assert not hasattr(api, "get_linear_track_sn")  # mirrors XArmAPI 1.18.5
     rail = RailController(api)
-    assert rail.detect() is False
-    api2 = FakeXArmAPI(has_rail=True, rail_sn="XXXX00000000")
-    assert RailController(api2).detect() is False
+    assert rail.detect() is True  # rail.py:77 used to raise AttributeError here
+    assert rail.phase is RailPhase.DETECTED
+    assert len(rail.warnings) == 1
+    assert "get_linear_track_sn" in rail.warnings[0]
 
 
-def test_present_rail_detected_by_registers_and_sn() -> None:
-    api = FakeXArmAPI(has_rail=True, rail_sn="AL1300FAKE1234")
+def test_sn_prefix_verified_only_when_the_sdk_exposes_it() -> None:
+    api = FakeWithTrackSn(has_rail=True, rail_sn="AL1300FAKE1234")
     rail = RailController(api)
     assert rail.detect() is True
-    assert rail.phase is RailPhase.DETECTED
+    assert rail.warnings == []
+    assert "get_linear_track_sn" in api.call_names()
+    # bogus SN (sim-mode controller answering track calls) -> absent
+    for bogus in ("", "XXXX00000000"):
+        assert RailController(FakeWithTrackSn(has_rail=True, rail_sn=bogus)).detect() is False
+
+
+def test_simulation_mode_controller_registers_noop_means_absent() -> None:
+    # @xarm_is_not_simulation_mode returns (0, []) without touching the bus
+    api = FakeXArmAPI(has_rail=True, simulation_robot=True)
+    rail = RailController(api)
+    assert rail.detect() is False
+    assert rail.phase is RailPhase.ABSENT
 
 
 def test_ensure_homed_homes_unhomed_rail_before_anything() -> None:
@@ -37,9 +59,7 @@ def test_ensure_homed_homes_unhomed_rail_before_anything() -> None:
     names = api.call_names()
     # back_origin BEFORE enable/speed; commanding unhomed would return 82
     assert "set_linear_track_back_origin" in names
-    assert names.index("set_linear_track_back_origin") < names.index(
-        "set_linear_track_enable"
-    )
+    assert names.index("set_linear_track_back_origin") < names.index("set_linear_track_enable")
     assert rail.phase is RailPhase.READY
     call = [c for c in api.calls if c[0] == "set_linear_track_back_origin"][0]
     assert call[2]["wait"] is True

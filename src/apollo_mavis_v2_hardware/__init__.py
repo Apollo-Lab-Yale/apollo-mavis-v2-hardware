@@ -1,8 +1,9 @@
 """apollo-mavis-v2-hardware: real xArm7 drivers for the apollo-mavis-v2 stack.
 
 Implements core's ArmInterface/CameraInterface/WorkcellInterface over the
-xArm-Python-SDK (pinned 1.18.5), plus NetworkManager auto-matching (netsetup)
-and V4L2/RealSense camera backends. Depends only on apollo-mavis-v2-core.
+xArm-Python-SDK (pinned 1.18.5), plus NetworkManager auto-matching (netsetup),
+V4L2/RealSense camera backends and a read-only controller state monitor
+(``ArmStateMonitor``, phase-09a). Depends only on apollo-mavis-v2-core.
 """
 
 from . import units
@@ -22,6 +23,14 @@ from .events import (
     TickStats,
 )
 from .grippers import ClassicGripper, G2Gripper, GripperBackend, NoGripper, make_gripper
+from .monitor import (
+    READ_ONLY_SDK_ATTRS,
+    READ_ONLY_SDK_METHODS,
+    ArmMonitorSample,
+    ArmMonitorStatus,
+    ArmStateMonitor,
+    controller_error_title,
+)
 from .netsetup import ArmNet, NetSetup
 from .rail import RailController, RailPhase
 from .workcell import ArmBringupStatus, HardwareWorkcell
@@ -57,6 +66,13 @@ __all__ = [
     "make_gripper",
     "RailController",
     "RailPhase",
+    # read-only monitor (phase-09a)
+    "ArmStateMonitor",
+    "ArmMonitorSample",
+    "ArmMonitorStatus",
+    "READ_ONLY_SDK_METHODS",
+    "READ_ONLY_SDK_ATTRS",
+    "controller_error_title",
     # netsetup / workcell
     "NetSetup",
     "ArmNet",

@@ -137,9 +137,7 @@ class HardwareWorkcell(WorkcellInterface):
         """
         deadline = time.monotonic() + timeout_s
         self._stopped = False
-        self._statuses = {
-            arm_id: ArmBringupStatus(arm_id=arm_id) for arm_id in self.arms
-        }
+        self._statuses = {arm_id: ArmBringupStatus(arm_id=arm_id) for arm_id in self.arms}
         self._bringup_errors = dict.fromkeys(self.arms)
 
         def push(status: ArmBringupStatus) -> None:
@@ -162,9 +160,7 @@ class HardwareWorkcell(WorkcellInterface):
         self.start_cameras()
         return {k: v.model_copy(deep=True) for k, v in self._statuses.items()}
 
-    def _network_stage(
-        self, push: Callable[[ArmBringupStatus], None]
-    ) -> dict[str, Any]:
+    def _network_stage(self, push: Callable[[ArmBringupStatus], None]) -> dict[str, Any]:
         """verify() then match() on miss; returns per-arm MatchResults."""
         results: dict[str, Any] = {}
         if self._netsetup is None:
@@ -240,6 +236,8 @@ class HardwareWorkcell(WorkcellInterface):
             return
         status.sn = getattr(driver, "sn", None)
         status.fw_version = getattr(driver, "fw_version", None)
+        # backstop / rail-detect warnings were dropped here before 2026-09-04
+        status.warnings.extend(str(w) for w in getattr(driver, "connect_warnings", []) or [])
         status.gripper = getattr(driver, "gripper_kind", "unknown")
         if driver.has_rail:
             rail_phase = getattr(driver, "rail_phase", None)

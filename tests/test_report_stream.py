@@ -75,19 +75,14 @@ def test_staleness_flips_at_150ms_and_recovers_via_replayer() -> None:
         elapsed = time.monotonic() - t0
         assert 0.12 <= elapsed <= 0.20, f"stale flipped at {elapsed * 1000:.0f} ms"
         wait_until(
-            lambda: any(
-                isinstance(e, StaleEvent) and e.stale for e in drv.drain_events()
-            ),
+            lambda: any(isinstance(e, StaleEvent) and e.stale for e in drv.drain_events()),
             timeout=1.0,
             msg="no StaleEvent(stale=True)",
         )
         replayer.resume()  # push resumes -> staleness clears automatically
-        wait_until(lambda: not drv.get_state().stale, timeout=1.0,
-                   msg="staleness never cleared")
+        wait_until(lambda: not drv.get_state().stale, timeout=1.0, msg="staleness never cleared")
         wait_until(
-            lambda: any(
-                isinstance(e, StaleEvent) and not e.stale for e in drv.drain_events()
-            ),
+            lambda: any(isinstance(e, StaleEvent) and not e.stale for e in drv.drain_events()),
             timeout=1.0,
             msg="no StaleEvent(stale=False)",
         )
@@ -128,7 +123,8 @@ def test_dq_finite_difference_with_ema() -> None:
         clock=fc.now,
     )
     drv._api = FakeXArmAPI()  # state path only; no connect
-    frame = {"cartesian": [0.0] * 6, "mode": 1, "state": 0, "cmdnum": 0}
+    drv._api.mode = 1  # SDK keeps mode on the instance; the payload has no "mode" key
+    frame = {"cartesian": [0.0] * 6, "state": 0, "cmdnum": 0}
     drv._on_report({**frame, "joints": [0.0] * 7})
     fc.jump(0.01)
     drv._on_report({**frame, "joints": [0.01] + [0.0] * 6})  # raw dq = 1.0 rad/s

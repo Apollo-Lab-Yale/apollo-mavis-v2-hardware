@@ -43,7 +43,7 @@ from .events import (
     StudioConflictWarning,
     TickStats,
 )
-from .grippers import GripperBackend, make_gripper, parse_fw
+from .grippers import GripperBackend, make_gripper, read_fw_tuple
 from .rail import RailController
 
 IS_REAL_READBACK_FW = (1, 9, 110)  # get_servo_angle(is_real=True) gate
@@ -261,6 +261,21 @@ def _default_api_factory(*args: Any, **kwargs: Any) -> Any:
     return XArmAPI(*args, **kwargs)
 
 
+def _api_mode(api: Any) -> int:
+    """Controller mode from the SDK's ``mode`` property (kept current by the
+    SDK report thread from the 30003 ``state_mode`` byte).
+
+    The report-callback PAYLOAD never carries ``mode`` (SDK 1.18.5
+    ``x3/base.py:1284-1300``; only ``register_mode_changed_callback`` does).
+    Reading ``data["mode"]`` yielded 0 and tripped the Studio-conflict detector
+    ~1.2 s after every connect (fixed 2026-09-04).
+    """
+    try:
+        return int(getattr(api, "mode", 0) or 0)
+    except (TypeError, ValueError):
+        return 0
+
+
 class XArmDriver(ArmInterface):
     """core.ArmInterface over one xArm7 control box (02-hardware §3)."""
 
@@ -370,7 +385,7 @@ class XArmDriver(ArmInterface):
             raise ArmIdentityError(
                 "identity", f"{cfg.arm_id}: sn={sn!r}, expected {cfg.expected_sn!r}"
             )
-        self._fw = parse_fw(str(getattr(api, "version", "") or "0.0.0"))
+        self._fw = read_fw_tuple(api)  # api.version_number, NOT the raw api.version string
         # 3. clear latched state, backstops, enable (required order)
         api.clean_warn()
         api.clean_error()
@@ -389,18 +404,25 @@ class XArmDriver(ArmInterface):
                 self._phase = DriverPhase.IDLE
                 raise RailExpectedError("rail", f"{cfg.arm_id}: expected rail not detected")
             self._has_rail = detected
+        self._connect_warnings.extend(rail.warnings)  # e.g. SN unverifiable (SDK 1.18.5)
         if self._has_rail:
             rail.ensure_homed()
             self._rail = rail
         # 5. gripper backend + report callback
         self._gripper = make_gripper(cfg.gripper, self._clock)
         self._gripper.init(api, self._fw)  # raises GripperInitError
+        # SDK 1.18.5 keywords ONLY (``xarm/wrapper/xarm_api.py:2222``): there is
+        # no ``report_mode`` — passing it raised TypeError on the first real
+        # connect (fixed 2026-09-04); mode comes from ``api.mode`` in _on_report.
         api.register_report_callback(
             self._on_report,
             report_cartesian=True,
             report_joints=True,
             report_state=True,
-            report_mode=True,
+            report_error_code=False,  # 30003 carries none; the monitor polls them
+            report_warn_code=False,
+            report_mtable=False,
+            report_mtbrake=False,
             report_cmd_num=True,
         )
         # 6. enter streaming; seed from the measured position
@@ -474,18 +496,14 @@ class XArmDriver(ArmInterface):
         else:
             dq = np.zeros(7)
         tau_raw = getattr(self._api, "joints_torque", None)
-        tau = (
-            np.asarray(tau_raw[:7], dtype=np.float64)
-            if tau_raw is not None
-            else np.zeros(7)
-        )
+        tau = np.asarray(tau_raw[:7], dtype=np.float64) if tau_raw is not None else np.zeros(7)
         cart = data.get("cartesian") or [0.0] * 6
         self._snap = _StateSnap(  # single reference assignment = GIL-atomic swap
             q=q,
             dq=dq,
             ee_pose_sdk=tuple(float(v) for v in cart[:6]),
             tau=tau,
-            mode=int(data.get("mode", 0)),
+            mode=_api_mode(self._api),  # payload has no "mode" key (SDK 1.18.5)
             state=int(data.get("state", 0)),
             cmd_num=int(data.get("cmdnum", 0)),
             mono_ts=now,
@@ -808,9 +826,7 @@ class _MonitorThread:
         # 1. link loss
         if getattr(api, "connected", True) is False:
             if d._phase != DriverPhase.LATCHED:
-                d._emit(
-                    FaultEvent(d.cfg.arm_id, source="report", code=-1, t_mono=d._clock())
-                )
+                d._emit(FaultEvent(d.cfg.arm_id, source="report", code=-1, t_mono=d._clock()))
                 d._latch("SDK connection lost")
             return
         # 2. err/warn poll (errors while holding)
@@ -855,8 +871,7 @@ class _MonitorThread:
             d._rail.step()
             for phase_name, rcode, detail in d._rail.drain_events():
                 d._emit(
-                    RailEvent(d.cfg.arm_id, phase=phase_name, code=rcode, detail=detail,
-                              t_mono=now)
+                    RailEvent(d.cfg.arm_id, phase=phase_name, code=rcode, detail=detail, t_mono=now)
                 )
         # 7. gripper queue + poll
         if d._gripper is not None:

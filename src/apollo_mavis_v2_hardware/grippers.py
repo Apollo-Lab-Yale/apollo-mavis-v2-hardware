@@ -23,7 +23,11 @@ GRASP_STATUS_FW = (3, 4, 3)
 
 
 def parse_fw(version: str) -> tuple[int, int, int]:
-    """Parse 'x.y.z' (tolerating suffixes like '2.7.100-beta') into a tuple."""
+    """Parse 'x.y.z' (tolerating suffixes like '2.7.100-beta') into a tuple.
+
+    Only for plain dotted strings (gripper firmware from ``get_gripper_version``).
+    Do NOT feed it ``api.version`` — see ``read_fw_tuple``.
+    """
     parts: list[int] = []
     for chunk in str(version).split(".")[:3]:
         digits = "".join(ch for ch in chunk if ch.isdigit())
@@ -31,6 +35,25 @@ def parse_fw(version: str) -> tuple[int, int, int]:
     while len(parts) < 3:
         parts.append(0)
     return (parts[0], parts[1], parts[2])
+
+
+def read_fw_tuple(api: Any) -> tuple[int, int, int]:
+    """Controller firmware as ``(major, minor, revision)`` for the fw gates.
+
+    SDK 1.18.5's ``api.version`` is the RAW controller string, e.g.
+    ``'7,7,XS1305,MC1303,v1.12.10'`` (axes, type, arm SN, box SN, fw) —
+    ``parse_fw`` on it produced a bogus major and every fw gate passed
+    (fixed 2026-09-04). ``api.version_number`` is the SDK-parsed tuple
+    (``x3/base.py:545``); ``parse_fw(api.version)`` stays only as a fallback
+    for doubles exposing a plain ``'x.y.z'`` string.
+    """
+    vn = getattr(api, "version_number", None)
+    if isinstance(vn, (tuple, list)) and len(vn) == 3:
+        try:
+            return (int(vn[0]), int(vn[1]), int(vn[2]))
+        except (TypeError, ValueError):
+            pass
+    return parse_fw(str(getattr(api, "version", "") or "0.0.0"))
 
 
 class GripperBackend(ABC):
@@ -134,7 +157,10 @@ class ClassicGripper(GripperBackend):
             and abs(pulse - self._last_sent_pulse) < self.MIN_DELTA_PULSE
         ):
             return
-        code = self._api.set_gripper_position(pulse, wait=False)  # NEVER wait=True
+        # NEVER wait=True; wait_motion=False skips the SDK's implicit wait_move()
+        # (``x3/gripper.py:560-568``), which would block the 5 Hz monitor thread
+        # while the arm streams in mode 1 (same fix as G2, 2026-09-04)
+        code = self._api.set_gripper_position(pulse, wait=False, wait_motion=False)
         if code == 0:
             self._last_sent_pulse = pulse
             self._last_send_t = now
@@ -210,7 +236,12 @@ class G2Gripper(GripperBackend):
             if cmd.speed is None
             else int(round(15 + cmd.speed * (225 - 15)))
         )
-        code = self._api.set_gripper_g2_position(mm, speed=speed, force=force, wait=False)
+        # wait_motion=False: without it the SDK runs wait_move() first
+        # (``x3/gripper.py:969-977``) and blocks the 5 Hz monitor thread while
+        # the arm is moving (fixed 2026-09-04)
+        code = self._api.set_gripper_g2_position(
+            mm, speed=speed, force=force, wait=False, wait_motion=False
+        )
         if code == 0:
             self._last_send_t = now
 

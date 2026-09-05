@@ -6,6 +6,16 @@ Treated as a slow axis: sparse absolute int-mm targets with ``wait=False``;
 the measured position is folded into ``ArmState.q[7]`` by the driver.
 Uses the ``*_linear_track_*`` SDK spelling throughout (alias of
 ``*_linear_motor_*`` since SDK 1.17.0).
+
+SDK 1.18.5 facts (verified in the pinned source, 2026-09-04): ``XArmAPI``
+exposes ``get_linear_track_registers/pos/status/error/is_enabled/on_zero``,
+``set_linear_track_*`` and ``clean_linear_track_error`` through its alias map
+(``wrapper/xarm_api.py:120-133``) but NO ``get_linear_track_sn`` /
+``get_linear_track_version`` (the ``x3`` layer has ``get_linear_motor_sn`` but
+the wrapper never surfaces it; ``__getattr__`` raises AttributeError).
+``registers['pos']`` is meaningless until the track is homed (``on_zero == 1``)
+AND enabled — the lab tracks read ``{pos: 0, status: 2, error: 0,
+is_enabled: 0, on_zero: 0}`` at power-on.
 """
 
 from __future__ import annotations
@@ -44,6 +54,7 @@ class RailController:
         self._last_sent_mm: int | None = None
         self._cleaned_once = False
         self._events: list[tuple[str, int, str]] = []  # (phase, code, detail)
+        self.warnings: list[str] = []  # non-fatal detect() notes -> driver.connect_warnings
 
     # -- properties ---------------------------------------------------------
     @property
@@ -64,20 +75,32 @@ class RailController:
 
     # -- bring-up -----------------------------------------------------------
     def detect(self) -> bool:
-        """Present = registers read OK AND the SN looks like a real track.
+        """Present = the track registers read OK (a real modbus reply).
 
         Absent tracks return code 3 (timeout) / 20 (host id) / 23 (modbus
-        length). Sim-mode controllers silently no-op track calls and return
-        success — requiring a valid AL13x SN catches that.
+        length). A controller in simulation mode never touches the bus: the
+        SDK's ``@xarm_is_not_simulation_mode`` returns ``(0, [])`` — an empty
+        non-dict reply — which we treat as absent. The AL13x SN prefix is
+        verified only when the SDK exposes ``get_linear_track_sn`` (1.18.5 does
+        NOT — calling it raised AttributeError on the first real connect, fixed
+        2026-09-04); otherwise one warning is recorded and the track is
+        accepted on the registers alone.
         """
-        code, _registers = self._api.get_linear_track_registers()
-        if code != 0:
+        code, registers = self._api.get_linear_track_registers()
+        if code != 0 or not isinstance(registers, dict) or "pos" not in registers:
             self._phase = RailPhase.ABSENT
             return False
-        sn_code, sn = self._api.get_linear_track_sn()
-        if sn_code != 0 or not str(sn or "").startswith(RAIL_SN_PREFIX):
-            self._phase = RailPhase.ABSENT
-            return False
+        read_sn = getattr(self._api, "get_linear_track_sn", None)
+        if callable(read_sn):
+            sn_code, sn = read_sn()
+            if sn_code != 0 or not str(sn or "").startswith(RAIL_SN_PREFIX):
+                self._phase = RailPhase.ABSENT
+                return False
+        else:
+            self.warnings.append(
+                "rail SN not verified: SDK has no get_linear_track_sn "
+                "(xarm-python-sdk 1.18.5); detected from registers only"
+            )
         self._phase = RailPhase.DETECTED
         return True
 

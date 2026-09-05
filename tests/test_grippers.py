@@ -10,6 +10,7 @@ from apollo_mavis_v2_hardware.grippers import (
     NoGripper,
     make_gripper,
     parse_fw,
+    read_fw_tuple,
 )
 
 FW_OLD = (2, 6, 107)
@@ -28,6 +29,20 @@ def test_parse_fw_tolerates_prefixes() -> None:
     assert parse_fw("3.4") == (3, 4, 0)
 
 
+def test_read_fw_tuple_uses_sdk_version_number_not_raw_version_string() -> None:
+    # what the lab boxes answer: axes,type,arm SN,box SN,fw (SDK 1.18.5 api.version)
+    api = FakeXArmAPI(version="7,7,XS1305,MC1303,v1.12.10")
+    assert parse_fw(api.version) != (1, 12, 10)  # the raw string fools parse_fw
+    assert read_fw_tuple(api) == (1, 12, 10)  # api.version_number is the truth
+
+
+def test_read_fw_tuple_falls_back_to_plain_version_string() -> None:
+    class Plain:
+        version = "v2.6.107"  # no version_number attribute at all
+
+    assert read_fw_tuple(Plain()) == (2, 6, 107)
+
+
 def test_classic_init_sequence() -> None:
     api = FakeXArmAPI()
     _classic(api, FakeClock())
@@ -43,7 +58,8 @@ def test_classic_half_open_is_425_pulses_and_force_ignored() -> None:
     calls = [c for c in api.calls if c[0] == "set_gripper_position"]
     assert len(calls) == 1
     assert calls[0][1] == (425,)  # 0.5 open frac <-> 425 pulses
-    assert calls[0][2] == {"wait": False}  # NEVER wait=True in-session
+    # NEVER wait=True in-session; wait_motion=False skips the SDK's wait_move()
+    assert calls[0][2] == {"wait": False, "wait_motion": False}
     assert "force" not in calls[0][2]
 
 
@@ -103,6 +119,7 @@ def test_g2_passes_force_through() -> None:
     assert call[1] == (42.0,)  # 0.5 -> 42 mm of the 84 mm span
     assert call[2]["force"] == 80  # normalized [0,1] -> percent
     assert call[2]["wait"] is False
+    assert call[2]["wait_motion"] is False  # else the SDK blocks in wait_move()
     assert g.force_capable
 
 

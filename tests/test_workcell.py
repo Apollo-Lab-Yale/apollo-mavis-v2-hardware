@@ -28,14 +28,17 @@ def _fast_sleep(s: float) -> None:
     time.sleep(min(s, 0.01))
 
 
-def make_workcell(fail_arms=frozenset(), netsetup=None, n_arms=2):
+def make_workcell(fail_arms=frozenset(), netsetup=None, n_arms=2, api_cls=FakeXArmAPI):
     apis: dict[str, FakeXArmAPI] = {}
 
     def driver_factory(cfg):
         def api_factory(ip, **kw):
-            api = FakeXArmAPI(
-                ip, auto_report_hz=100.0, has_rail=(cfg.arm_id == "arm2"),
-                rail_homed=True, **kw,
+            api = api_cls(
+                ip,
+                auto_report_hz=100.0,
+                has_rail=(cfg.arm_id == "arm2"),
+                rail_homed=True,
+                **kw,
             )
             if cfg.arm_id in fail_arms:
                 api.connected = False  # ArmConnectError after retries
@@ -44,8 +47,7 @@ def make_workcell(fail_arms=frozenset(), netsetup=None, n_arms=2):
 
         return XArmDriver(cfg, api_factory=api_factory, sleep=_fast_sleep)
 
-    wc = HardwareWorkcell(_wc_config(n_arms), driver_factory=driver_factory,
-                          netsetup=netsetup)
+    wc = HardwareWorkcell(_wc_config(n_arms), driver_factory=driver_factory, netsetup=netsetup)
     return wc, apis
 
 
@@ -104,8 +106,9 @@ class StubNetSetup:
 
     def verify(self):
         return {
-            "arm1": MatchResult("arm1", "enp36s0f0", "08:BF:B8:89:4F:3A",
-                                "uuid-1", self.probe_result, ""),
+            "arm1": MatchResult(
+                "arm1", "enp36s0f0", "08:BF:B8:89:4F:3A", "uuid-1", self.probe_result, ""
+            ),
         }
 
     def match(self):  # pragma: no cover - verify() succeeds in these tests
@@ -139,3 +142,26 @@ def test_shutdown_idempotent_and_stop_alias():
     wc.stop()
     wc.stop()  # never raises
     assert wc.kind == "hardware"
+
+
+class _BackstopFailingApi(FakeXArmAPI):
+    def set_collision_sensitivity(self, value, wait=True):
+        self._rec("set_collision_sensitivity", value)
+        return 1  # non-fatal: apply_backstops turns it into a warning
+
+
+def test_driver_connect_warnings_reach_bringup_status():
+    """Backstop + rail-detect warnings were dropped on the floor before 2026-09-04."""
+    wc, apis = make_workcell(api_cls=_BackstopFailingApi)
+    try:
+        statuses = wc.bring_up(timeout_s=20.0)
+        for arm_id in ("arm1", "arm2"):
+            assert statuses[arm_id].connected
+            assert any(
+                "set_collision_sensitivity returned 1" in w for w in statuses[arm_id].warnings
+            )
+        # only arm2 has a rail; SDK 1.18.5 cannot verify its SN
+        assert any("get_linear_track_sn" in w for w in statuses["arm2"].warnings)
+        assert not any("get_linear_track_sn" in w for w in statuses["arm1"].warnings)
+    finally:
+        wc.shutdown()

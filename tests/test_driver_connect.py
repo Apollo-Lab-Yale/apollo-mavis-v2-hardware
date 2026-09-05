@@ -15,6 +15,7 @@ from fakes.fake_xarm_api import FakeXArmAPI
 
 from apollo_mavis_v2_hardware.config import XArmDriverConfig
 from apollo_mavis_v2_hardware.driver import ArmFaultedError, DriverPhase, XArmDriver
+from apollo_mavis_v2_hardware.events import StudioConflictWarning
 
 
 def make_driver(fake_kwargs=None, cfg_kwargs=None, connect=True):
@@ -83,8 +84,10 @@ def test_command_joints_rad_reaches_fake_unchanged() -> None:
         target = np.array(seed) + 0.004  # reachable within a few ticks
         drv.command_joints(target)
         wait_until(
-            lambda: h["api"].sent_joints
-            and np.allclose(h["api"].sent_joints[-1][1], target, atol=1e-12),
+            lambda: (
+                h["api"].sent_joints
+                and np.allclose(h["api"].sent_joints[-1][1], target, atol=1e-12)
+            ),
             msg="target never reached the fake in radians",
         )
     finally:
@@ -209,3 +212,57 @@ def test_disconnect_idempotent() -> None:
     drv.disconnect()
     drv.disconnect()  # never raises
     assert drv.phase is DriverPhase.IDLE
+
+
+# -- SDK 1.18.5 surface regressions (first real-box contact, fixed 2026-09-04) ----
+
+
+def test_fw_gates_come_from_version_number_not_raw_version_string() -> None:
+    drv, h = make_driver(fake_kwargs={"version": "7,7,XS1305,MC1303,v1.12.10"})
+    try:
+        assert drv._fw == (1, 12, 10)  # parse_fw(api.version) gave a bogus major
+        assert drv.fw_version == "1.12.10"
+    finally:
+        drv.disconnect()
+
+
+def test_report_callback_uses_sdk_1_18_5_keywords_only() -> None:
+    # the fake's register_report_callback has the exact SDK signature: a stray
+    # ``report_mode=True`` would already have raised TypeError inside connect()
+    drv, h = make_driver()
+    try:
+        call = [c for c in h["api"].calls if c[0] == "register_report_callback"][0]
+        assert "report_mode" not in call[2]
+        assert set(call[2]) <= FakeXArmAPI.REPORT_CALLBACK_KEYWORDS
+        assert call[2]["report_joints"] and call[2]["report_cartesian"]
+        assert call[2]["report_state"] and call[2]["report_cmd_num"]
+    finally:
+        drv.disconnect()
+
+
+def test_snapshot_mode_comes_from_api_property_not_payload() -> None:
+    """The 30003 payload has no ``mode``; reading it as 0 used to trip the
+    Studio-conflict detector ~1.2 s after every connect and LATCH the arm."""
+    drv, h = make_driver()
+    try:
+        wait_until(lambda: drv._snap is not None and drv._snap.mode == 1)
+        time.sleep(0.7)  # past the 0.5 s set_mode grace window
+        assert drv.phase is DriverPhase.STREAMING
+        assert not any(isinstance(e, StudioConflictWarning) for e in drv.drain_events())
+        assert drv.get_state().mode == 1
+    finally:
+        drv.disconnect()
+
+
+def test_rail_without_sn_api_is_detected_and_warns_via_connect_warnings() -> None:
+    drv, h = make_driver(fake_kwargs={"has_rail": True, "rail_homed": True})
+    try:
+        assert drv.has_rail and drv.dof == 8
+        assert any("get_linear_track_sn" in w for w in drv.connect_warnings)
+    finally:
+        drv.disconnect()
+    drv2, _ = make_driver()  # no rail: no rail warning either
+    try:
+        assert not any("get_linear_track_sn" in w for w in drv2.connect_warnings)
+    finally:
+        drv2.disconnect()
