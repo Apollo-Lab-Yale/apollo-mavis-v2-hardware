@@ -1,14 +1,17 @@
 """Recovery state machine (02-hardware §3.5): C24, budget, 111, Studio, e-stop."""
 
+import threading
 import time
 
 import numpy as np
 import pytest
+from apollo_mavis_v2_core import CommandError
 from fakes.fake_xarm_api import FaultScript
 from test_driver_connect import make_driver, wait_until
 
-from apollo_mavis_v2_hardware.driver import ArmFaultedError, DriverPhase
+from apollo_mavis_v2_hardware.driver import ArmFaultedError, DriverPhase, RecoveryResult
 from apollo_mavis_v2_hardware.events import (
+    FaultEvent,
     RecoveredEvent,
     ReseedEvent,
     StudioConflictWarning,
@@ -184,5 +187,128 @@ def test_studio_conflict_warns_retries_then_latches() -> None:
         api.state = 2
         wait_until(lambda: drv.phase is DriverPhase.LATCHED, timeout=5.0,
                    msg="second conflict never latched")
+    finally:
+        drv.disconnect()
+
+
+# -- request_recovery() / recovery_result() (phase-09b) ---------------------------------
+
+
+def _record_threads(api, *names):
+    seen: dict[str, str] = {}
+    for name in names:
+        orig = getattr(api, name)
+
+        def wrapper(*a, _orig=orig, _name=name, **k):
+            seen[_name] = threading.current_thread().name
+            return _orig(*a, **k)
+
+        setattr(api, name, wrapper)
+    return seen
+
+
+def test_request_recovery_runs_on_the_monitor_thread_and_reaches_drain_events() -> None:
+    drv, h = make_driver()
+    api = h["api"]
+    try:
+        api.inject_error(1)  # e-stop variant: UNRECOVERABLE -> LATCHED, no auto-resume
+        wait_until(lambda: drv.phase is DriverPhase.LATCHED)
+        auto = drv.recovery_result()
+        assert isinstance(auto, RecoveryResult) and not auto.ok and not auto.user_initiated
+        assert auto.error_code == 1 and auto.detail == "controller error 1"
+        drv.drain_events()  # discard the fault history
+        seen = _record_threads(api, "clean_error", "clean_warn", "motion_enable", "set_mode")
+        drv.request_recovery()  # returns at once; nothing ran on this thread
+        assert "clean_error" not in seen
+        events = collect_until(drv, lambda evs: any(isinstance(e, RecoveredEvent) for e in evs))
+        assert drv.phase is DriverPhase.STREAMING
+        assert set(seen.values()) == {"hw.a1.monitor"}  # the driver's 5 Hz monitor thread
+        kinds = [type(e) for e in events if type(e) in (FaultEvent, ReseedEvent, RecoveredEvent)]
+        assert kinds == [FaultEvent, ReseedEvent, RecoveredEvent]
+        fault = next(e for e in events if isinstance(e, FaultEvent))
+        assert fault.source == "user" and fault.error_code == 1  # C1 still latched at capture
+        recovered = next(e for e in events if isinstance(e, RecoveredEvent))
+        assert recovered.arm_id == "a1"
+        # binding order on the wire: clean_error -> clean_warn -> motion_enable -> mode 1 -> state 0
+        calls = api.calls
+        i_clean = _last_index(calls, "clean_error")
+        i_warn = _last_index(calls, "clean_warn")
+        i_enable = _last_index(calls, "motion_enable")
+        i_mode = _last_index(calls, "set_mode", (1,))
+        i_state = _last_index(calls, "set_state", (0,))
+        assert i_clean < i_warn < i_enable < i_mode < i_state
+        res = drv.recovery_result()
+        assert res is not None and res.ok and res.user_initiated and res.seq == auto.seq + 1
+        assert res.detail == ""
+        with_rail_free = drv.get_state()
+        assert with_rail_free.error_code == 0
+    finally:
+        drv.disconnect()
+
+
+def test_request_recovery_with_estop_engaged_stays_latched_and_reports_it() -> None:
+    drv, h = make_driver()
+    api = h["api"]
+    try:
+        api.inject_error(1)
+        wait_until(lambda: drv.phase is DriverPhase.LATCHED)
+        seq0 = drv.recovery_result().seq
+        api.motion_enable_fails = True  # the physical e-stop is still down
+        drv.drain_events()
+        drv.request_recovery()
+        wait_until(lambda: (r := drv.recovery_result()) is not None and r.seq > seq0)
+        res = drv.recovery_result()
+        assert not res.ok and res.user_initiated
+        assert res.detail.startswith("motion_enable failed")
+        assert drv.phase is DriverPhase.LATCHED
+        events = drv.drain_events()
+        latch = [e for e in events if isinstance(e, FaultEvent) and e.source == "latch"]
+        assert latch and latch[0].detail.startswith("motion_enable failed")
+        assert not any(isinstance(e, RecoveredEvent) for e in events)
+        with pytest.raises(ArmFaultedError):
+            drv.command_joints(np.zeros(7))
+        api.motion_enable_fails = False  # button released: try again
+        drv.request_recovery()
+        wait_until(lambda: drv.phase is DriverPhase.STREAMING)
+        assert drv.recovery_result().ok
+    finally:
+        drv.disconnect()
+
+
+def test_request_recovery_from_streaming_reseeds_without_moving() -> None:
+    seed = [0.2] * 7
+    drv, h = make_driver(fake_kwargs={"initial_q": list(seed)})
+    api = h["api"]
+    try:
+        wait_until(lambda: len(api.sent_joints) > 5)
+        drv.drain_events()
+        drv.request_recovery()
+        events = collect_until(drv, lambda evs: any(isinstance(e, RecoveredEvent) for e in evs))
+        reseed = next(e for e in events if isinstance(e, ReseedEvent))
+        assert np.allclose(reseed.q, seed, atol=1e-12)  # re-seeded from the measured position
+        assert drv.phase is DriverPhase.STREAMING
+        wait_until(lambda: len(api.sent_joints) > 0 and np.allclose(api.sent_joints[-1][1], seed))
+    finally:
+        drv.disconnect()
+
+
+def test_request_recovery_requires_a_connected_driver() -> None:
+    drv, _ = make_driver(connect=False)
+    with pytest.raises(CommandError):
+        drv.request_recovery()
+    assert drv.recovery_result() is None
+    drv2, _ = make_driver()
+    drv2.disconnect()
+    with pytest.raises(CommandError):
+        drv2.request_recovery()
+
+
+def test_auto_recovery_records_its_result_too() -> None:
+    drv, h = make_driver(fake_kwargs={"fault_script": FaultScript(fault_at_tick=10, error_code=24)})
+    try:
+        drv.command_joints(np.full(7, 0.3))
+        collect_until(drv, lambda evs: any(isinstance(e, RecoveredEvent) for e in evs))
+        res = drv.recovery_result()
+        assert res is not None and res.ok and res.error_code == 24 and not res.user_initiated
     finally:
         drv.disconnect()

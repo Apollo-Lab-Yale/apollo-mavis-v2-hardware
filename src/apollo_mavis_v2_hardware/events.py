@@ -10,7 +10,9 @@ class FaultEvent:
     """A fault was detected (controller error, bad servo return, link loss)."""
 
     arm_id: str
-    source: str  # "servo" | "monitor" | "report" | "external" | "user_stop"
+    # "servo" | "monitor" | "report" | "external" | "user_stop" | "user" (start of an
+    # operator-requested recovery) | "latch" (recovery gave up: budget / unrecoverable)
+    source: str
     code: int  # API return code or controller error code
     error_code: int = 0  # controller error at capture time
     warn_code: int = 0

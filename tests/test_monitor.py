@@ -1,9 +1,11 @@
-"""ArmStateMonitor (02-hardware §8.5, phase-09a): read-only polling, ZERO writes,
-rail/gripper semantics + units, stale detection, reconnect backoff, hand-over."""
+"""ArmStateMonitor (02-hardware §8.5, phase-09a/09b): read-only polling, ZERO writes
+unless an explicit maintenance request, rail/gripper semantics + units, safety
+read-backs, stale detection, reconnect backoff, hand-over, maintenance channel."""
 
 from __future__ import annotations
 
 import math
+import threading
 import time
 
 import pytest
@@ -11,12 +13,17 @@ from conftest import FakeClock
 from fakes.fake_xarm_api import FakeXArmAPI
 from test_driver_connect import wait_until
 
+from apollo_mavis_v2_hardware.backstops import apply_backstops, expected_backstop_sequence
+from apollo_mavis_v2_hardware.config import XArmDriverConfig
 from apollo_mavis_v2_hardware.monitor import (
+    MAINTENANCE_OPS,
+    MAINTENANCE_SDK_METHODS,
     MAX_RECONNECT_S,
     READ_ONLY_SDK_ATTRS,
     READ_ONLY_SDK_METHODS,
     ArmMonitorSample,
     ArmStateMonitor,
+    MaintenanceOutcome,
     controller_error_title,
 )
 
@@ -280,6 +287,31 @@ def test_zero_writes_only_allowlisted_sdk_members_are_touched() -> None:
     assert (raw.state, raw.mode, raw.error_code, raw.warn_code, raw.motion_enabled) == before
     assert before[:2] == (2, 0)  # never enabled, never left mode 0
     assert raw.rail_pos_commands == [] and raw._rail_on_zero == 0  # rail never homed/moved
+    # the safety read-backs are PROPERTY reads (no get_* exists in SDK 1.18.5), never set_*
+    assert {"collision_sensitivity", "tcp_load"} <= set(api.attrs)
+    assert not (MAINTENANCE_SDK_METHODS["clear_errors"] & set(api.methods))
+    assert not (MAINTENANCE_SDK_METHODS["apply_backstops"] & set(api.methods))
+    assert mon.maintenance_busy is False
+
+
+def test_slow_round_reads_back_sensitivity_and_tcp_load() -> None:
+    # the Perception Arm as found 2026-09-04: sensitivity 1, payload 0 kg
+    mon, h = make_monitor({"collision_sensitivity": 1}, gripper="none", arm_id="view")
+    try:
+        mon.start()
+        s = wait_sample(mon, lambda x: x.collision_sensitivity is not None)
+        assert s.collision_sensitivity == 1
+        assert s.tcp_load_kg == 0.0 and s.tcp_load_cog_mm == (0.0, 0.0, 0.0)
+        raw = h["raw"]
+        raw.collision_sensitivity = 3  # what the rich report frame would carry after set_*
+        raw.tcp_load = [0.55, [0.0, 0.0, 90.0]]
+        s = wait_sample(mon, lambda x: x.collision_sensitivity == 3)
+        assert s.tcp_load_kg == pytest.approx(0.55) and s.tcp_load_cog_mm == (0.0, 0.0, 90.0)
+        raw.tcp_load = None  # unreadable -> None / ()
+        s = wait_sample(mon, lambda x: x.tcp_load_kg is None)
+        assert s.tcp_load_cog_mm == () and s.collision_sensitivity == 3
+    finally:
+        mon.stop()
 
 
 # -- lifecycle: stop / disconnect (hand-over) / restart ---------------------------------
@@ -510,3 +542,381 @@ def test_ctor_validation() -> None:
         ArmStateMonitor("a", "1.2.3.4", gripper="none", expect_rail=False, poll_hz=0)
     with pytest.raises(ValueError):
         ArmStateMonitor("a", "1.2.3.4", gripper="robotiq", expect_rail=False)  # type: ignore[arg-type]
+
+
+# -- maintenance channel (phase-09b) -------------------------------------------------
+
+
+def record_threads(raw, *names: str) -> dict[str, str]:
+    """Wrap fake methods so the test learns WHICH thread called them."""
+    seen: dict[str, str] = {}
+    for name in names:
+        orig = getattr(raw, name)
+
+        def wrapper(*a, _orig=orig, _name=name, **k):
+            seen[_name] = threading.current_thread().name
+            return _orig(*a, **k)
+
+        setattr(raw, name, wrapper)
+    return seen
+
+
+def _backstop_cfg(**overrides) -> XArmDriverConfig:
+    base = dict(
+        arm_id="grip",
+        ip="192.168.1.201",
+        gripper="xarm_g2",
+        tcp_load_kg=0.95,
+        tcp_load_cog_mm=(0.0, 0.0, 60.0),
+        collision_sensitivity=3,
+    )
+    base.update(overrides)
+    return XArmDriverConfig(**base)
+
+
+def test_maintenance_clear_errors_writes_exactly_clean_error_and_clean_warn() -> None:
+    mon, h = make_monitor({"has_rail": True}, gripper="none", proxy=True, arm_id="view")
+    try:
+        mon.start()
+        wait_sample(mon, lambda x: x.rail_present is not None)
+        raw = h["raw"]
+        raw.error_code, raw.warn_code = 19, 11  # the Perception Arm's live C19 + a warning
+        wait_sample(mon, lambda x: x.error_code == 19)
+        threads = record_threads(raw, "clean_error", "clean_warn")
+        before_state = (raw.state, raw.mode, raw.motion_enabled)
+        out = mon.maintenance("clear_errors", timeout_s=3.0)
+        assert isinstance(out, MaintenanceOutcome)
+        assert out.ok, out.detail
+        assert out.arm_id == "view" and out.op == "clear_errors"
+        assert out.before is not None and out.before.error_code == 19 and out.before.warn_code == 11
+        assert out.after is not None and out.after.error_code == 0 and out.after.warn_code == 0
+        assert out.after.seq > out.before.seq
+        assert out.after.rail_present is True  # slow fields refreshed right after the op
+        assert list(out.sdk_codes.items()) == [("clean_error", 0), ("clean_warn", 0)]
+        assert out.warnings == ()
+        assert out.detail == (
+            "cleared controller error 19: End Effector Communication Error "
+            "and controller warning 11"
+        )
+        # executed ON THE POLL THREAD, never on the caller's
+        assert set(threads.values()) == {"hw.view.monitor-ro"}
+        assert (raw.state, raw.mode, raw.motion_enabled) == before_state  # no enable, no mode
+        assert mon.maintenance_busy is False
+        assert mon.status == "running"
+        wait_sample(mon, lambda x: x.seq > out.after.seq)  # polling continues
+    finally:
+        mon.stop()
+    api = h["api"]
+    mutating = [n for n in api.methods if n not in READ_ONLY_SDK_METHODS]
+    assert mutating == ["clean_error", "clean_warn"]  # the write set, exactly, in order
+    assert set(mutating) == MAINTENANCE_SDK_METHODS["clear_errors"]
+    assert set(api.attrs) <= READ_ONLY_SDK_ATTRS
+    assert not any(n.startswith(("set_", "motion_", "register_")) for n in api.methods)
+
+
+def test_maintenance_clear_errors_outcomes_without_error_and_when_it_relatches() -> None:
+    mon, h = make_monitor({}, gripper="none", arm_id="view")
+    try:
+        mon.start()
+        wait_sample(mon)
+        out = mon.maintenance("clear_errors", timeout_s=3.0)
+        assert out.ok and out.detail.startswith("no controller error or warning was latched")
+        raw = h["raw"]
+        # clean_error answers 0 but the controller re-latches immediately (hardware fault)
+        raw.error_code = 19
+        wait_sample(mon, lambda x: x.error_code == 19)
+        raw.clean_error = lambda: 0  # type: ignore[method-assign]
+        out = mon.maintenance("clear_errors", timeout_s=3.0)
+        assert not out.ok
+        assert out.detail == (
+            "controller error 19: End Effector Communication Error re-latched right after clearing"
+        )
+        assert out.after is not None and out.after.error_code == 19
+        # a nonzero SDK return code
+        raw.clean_error = lambda: 1  # type: ignore[method-assign]
+        out = mon.maintenance("clear_errors", timeout_s=3.0)
+        assert not out.ok and out.detail == "clean_error returned 1"
+        assert out.sdk_codes == {"clean_error": 1, "clean_warn": 0}
+    finally:
+        mon.stop()
+
+
+def test_maintenance_apply_backstops_matches_backstops_py_sequence() -> None:
+    cfg = _backstop_cfg(reduced_tcp_boundary_mm=(700, -700, 600, -600, 800, 0))
+    mon, h = make_monitor({"has_rail": True}, gripper="xarm_g2", proxy=True)
+    try:
+        mon.start()
+        s0 = wait_sample(mon, lambda x: x.collision_sensitivity is not None)
+        assert s0.collision_sensitivity == 0 and s0.tcp_load_kg == 0.0  # as found on the boxes
+        raw = h["raw"]
+        threads = record_threads(raw, "set_tcp_load", "set_collision_rebound")
+        out = mon.maintenance("apply_backstops", cfg, timeout_s=3.0)
+        assert out.ok, out.detail
+        assert out.warnings == ()
+        assert out.detail == (
+            "safety settings applied: sensitivity 3, payload 0.95 kg at (0, 0, 60) mm, "
+            "reduced-mode boundary on"
+        )
+        # the write set == backstops.py, same order, all codes 0
+        ref = FakeXArmAPI()
+        apply_backstops(ref, cfg)
+        assert list(out.sdk_codes) == ref.call_names() == list(expected_backstop_sequence(cfg))
+        assert set(out.sdk_codes.values()) == {0}
+        # read-back right after the op reflects the config
+        assert out.after is not None
+        assert out.after.collision_sensitivity == 3
+        assert out.after.tcp_load_kg == pytest.approx(0.95)
+        assert out.after.tcp_load_cog_mm == (0.0, 0.0, 60.0)
+        assert out.before is not None and out.before.collision_sensitivity == 0
+        assert set(threads.values()) == {"hw.grip.monitor-ro"}
+        assert raw.motion_enabled is False and raw.mode == 0  # still nothing enabled / moved
+        assert "save_conf" not in raw.call_names()
+        wait_sample(mon, lambda x: x.seq > out.after.seq and x.collision_sensitivity == 3)
+    finally:
+        mon.stop()
+    api = h["api"]
+    mutating = [n for n in api.methods if n not in READ_ONLY_SDK_METHODS]
+    assert mutating == ref.call_names()
+    assert set(mutating) <= MAINTENANCE_SDK_METHODS["apply_backstops"]
+    assert set(api.attrs) <= READ_ONLY_SDK_ATTRS
+    # without a reduced boundary the two reduced-mode calls are absent
+    ref2 = FakeXArmAPI()
+    apply_backstops(ref2, _backstop_cfg())
+    assert ref2.call_names() == list(expected_backstop_sequence(_backstop_cfg()))
+    assert "set_reduced_mode" not in ref2.call_names()
+
+
+def test_maintenance_apply_backstops_reports_nonzero_codes_as_failure() -> None:
+    mon, h = make_monitor({}, gripper="xarm_g2")
+    try:
+        mon.start()
+        wait_sample(mon)
+        raw = h["raw"]
+        raw.set_collision_sensitivity = lambda value, wait=True: 1  # type: ignore[method-assign]
+        out = mon.maintenance("apply_backstops", _backstop_cfg(), timeout_s=3.0)
+        assert not out.ok
+        assert out.warnings == ("set_collision_sensitivity returned 1",)
+        assert out.detail == "set_collision_sensitivity returned 1"
+        assert out.sdk_codes["set_collision_sensitivity"] == 1
+        assert out.sdk_codes["set_tcp_load"] == 0  # the rest was still applied
+        assert out.after is not None and out.after.tcp_load_kg == pytest.approx(0.95)
+    finally:
+        mon.stop()
+
+
+def test_maintenance_apply_backstops_tolerates_state_not_ready_when_read_back_matches() -> None:
+    """Live 2026-09-04: with the arm stopped (state 4/5) set_tcp_load returns APIState 9
+    although the controller stores the value; the read-back decides, the op is ok."""
+    mon, h = make_monitor({}, gripper="xarm_g2")
+    try:
+        mon.start()
+        wait_sample(mon)
+        raw = h["raw"]
+        real_set = raw.set_tcp_load
+
+        def stopped_set_tcp_load(weight, cog, wait=False, **kw):
+            real_set(weight, cog, wait=wait, **kw)  # stored anyway
+            return 9
+
+        raw.set_tcp_load = stopped_set_tcp_load  # type: ignore[method-assign]
+        out = mon.maintenance("apply_backstops", _backstop_cfg(), timeout_s=3.0)
+        assert out.ok and out.sdk_codes["set_tcp_load"] == 9
+        assert "verified by read-back" in out.detail
+        assert out.after is not None and out.after.tcp_load_kg == pytest.approx(0.95)
+    finally:
+        mon.stop()
+
+
+def test_maintenance_refusals_never_touch_the_sdk() -> None:
+    mon, h = make_monitor({}, gripper="none")
+    with pytest.raises(ValueError):
+        mon.maintenance("home_rail")  # type: ignore[arg-type]
+    assert MAINTENANCE_OPS == ("clear_errors", "apply_backstops", "recover")
+    # not started: off
+    out = mon.maintenance("clear_errors", timeout_s=0.5)
+    assert not out.ok and "monitor off" in out.detail and "raw" not in h
+    # recover needs a session driver (enable + servo mode), never the monitor
+    out = mon.maintenance("recover", timeout_s=0.5)
+    assert not out.ok and out.detail == "recover needs a session"
+    out = mon.maintenance("apply_backstops", None, timeout_s=0.5)
+    assert not out.ok and "driver config" in out.detail
+    try:
+        mon.start()
+        wait_sample(mon)
+        out = mon.maintenance("recover", timeout_s=0.5)
+        assert not out.ok and out.detail == "recover needs a session"
+        mon.disconnect()  # hand-over: paused
+        out = mon.maintenance("clear_errors", timeout_s=0.5)
+        assert not out.ok and "monitor paused" in out.detail
+        mutating = [n for n in h["raw"].call_names() if n not in READ_ONLY_SDK_METHODS]
+        assert mutating == []
+    finally:
+        mon.stop()
+    # unreachable box: status error
+    mon2, _ = make_monitor({}, gripper="none", connect_fail_times=10**6)
+    try:
+        mon2.start()
+        wait_until(lambda: mon2.status == "error")
+        out = mon2.maintenance("clear_errors", timeout_s=0.5)
+        assert not out.ok and "monitor error" in out.detail and "connect" in out.detail
+    finally:
+        mon2.stop()
+
+
+def test_maintenance_timeout_drops_the_late_result_and_polling_continues() -> None:
+    mon, h = make_monitor({}, gripper="none")
+    try:
+        mon.start()
+        wait_sample(mon)
+        raw = h["raw"]
+
+        def slow_clean_error() -> int:
+            time.sleep(0.3)
+            raw.error_code = 0
+            return 0
+
+        raw.clean_error = slow_clean_error  # type: ignore[method-assign]
+        t0 = time.monotonic()
+        out = mon.maintenance("clear_errors", timeout_s=0.05)
+        assert time.monotonic() - t0 < 0.25
+        assert not out.ok and "clear_errors timed out after 0.05 s" in out.detail
+        assert mon.maintenance_busy is True  # still executing on the poll thread
+        wait_until(lambda: not mon.maintenance_busy, timeout=3.0)
+        s = mon.snapshot()
+        assert s is not None
+        wait_sample(mon, lambda x: x.seq > s.seq)  # the monitor kept polling afterwards
+        assert mon.status == "running"
+        assert raw.call_names().count("clean_warn") == 1  # the op ran exactly once
+    finally:
+        mon.stop()
+
+
+def test_maintenance_sdk_exception_fails_the_request_and_reconnects() -> None:
+    mon, h = make_monitor({}, gripper="none")
+    try:
+        mon.start()
+        wait_sample(mon)
+        first = h["raw"]
+
+        def boom() -> int:
+            raise Exception("socket closed")  # what the SDK raises
+
+        first.clean_error = boom  # type: ignore[method-assign]
+        out = mon.maintenance("clear_errors", timeout_s=3.0)
+        assert not out.ok
+        assert out.detail == "clear_errors failed: Exception: socket closed"
+        assert out.sdk_codes == {} and out.after is None and out.before is not None
+        # the box counts as lost: fresh client, polling resumes
+        wait_until(lambda: h["raw"] is not first and mon.status == "running")
+        assert first.connected is False
+        assert mon.maintenance_busy is False
+    finally:
+        mon.stop()
+
+
+def test_maintenance_request_queued_during_an_sdk_call_fails_on_hand_over() -> None:
+    """The request is still QUEUED (never popped) when disconnect() runs: it fails
+    with the hand-over text and no write is ever issued."""
+    mon, h = make_monitor({}, gripper="none")
+    mon.start()
+    wait_sample(mon)
+    raw = h["raw"]
+    good = raw.get_position
+    inside = threading.Event()
+
+    def slow_get_position(*a, **k):
+        inside.set()  # the poll thread is now blocked inside the SDK
+        time.sleep(0.6)
+        return good(*a, **k)
+
+    raw.get_position = slow_get_position  # type: ignore[method-assign]
+    wait_until(inside.is_set, msg="poll never entered the slow SDK call")
+    result: dict = {}
+    t = threading.Thread(
+        target=lambda: result.update(out=mon.maintenance("clear_errors", timeout_s=5.0))
+    )
+    t.start()
+    wait_until(lambda: mon.maintenance_busy, msg="request never queued")
+    assert mon._maintenance_active is False  # queued, not popped: the thread is polling
+    assert mon.disconnect(timeout=3.0) is True
+    t.join(3.0)
+    out = result["out"]
+    assert not out.ok and out.detail == "monitor paused: released for hand-over"
+    assert "clean_error" not in raw.call_names()  # never ran
+    assert mon.maintenance_busy is False
+    assert raw.connected is False
+
+
+def test_maintenance_in_flight_request_refuses_before_its_first_write_on_hand_over() -> None:
+    """The request was POPPED and its before-sample is inside the SDK when
+    disconnect() runs: the op re-checks the hand-over before the first write and
+    refuses; disconnect() waits for that and returns True (box released)."""
+    mon, h = make_monitor({}, gripper="none")
+    mon.start()
+    wait_sample(mon)
+    raw = h["raw"]
+    good = raw.get_position
+
+    def slow_get_position(*a, **k):
+        time.sleep(1.0)  # every poll (incl. the before-sample) sits in the SDK for 1 s
+        return good(*a, **k)
+
+    raw.get_position = slow_get_position  # type: ignore[method-assign]
+    result: dict = {}
+    t = threading.Thread(
+        target=lambda: result.update(out=mon.maintenance("clear_errors", timeout_s=5.0))
+    )
+    t.start()
+    # popped: the poll thread is executing the request (before-sample, >= 1 s in the SDK)
+    wait_until(lambda: mon._maintenance_active, timeout=5.0, msg="request never popped")
+    t0 = time.monotonic()
+    assert mon.disconnect(timeout=3.0) is True
+    assert time.monotonic() - t0 < 2.5  # only the before-sample's SDK call was waited for
+    t.join(3.0)
+    out = result["out"]
+    assert not out.ok and out.detail == "monitor paused: released for hand-over"
+    assert out.sdk_codes == {} and out.after is None
+    assert "clean_error" not in raw.call_names() and "clean_warn" not in raw.call_names()
+    assert mon.maintenance_busy is False
+    assert mon.status == "paused"
+    assert raw.connected is False
+
+
+def test_maintenance_hand_over_mid_write_waits_for_the_op_and_reports_the_writes() -> None:
+    """disconnect() lands AFTER the first write went out: the monitor waits for the
+    op instead of disconnecting the client under it, the read-back is skipped and
+    the outcome still says what was written."""
+    mon, h = make_monitor({}, gripper="none")
+    mon.start()
+    wait_sample(mon)
+    raw = h["raw"]
+    raw.error_code = 19
+    wait_sample(mon, lambda x: x.error_code == 19)
+    good_warn = raw.clean_warn
+
+    def slow_clean_warn() -> int:
+        time.sleep(0.6)
+        return good_warn()
+
+    raw.clean_warn = slow_clean_warn  # type: ignore[method-assign]
+    result: dict = {}
+    t = threading.Thread(
+        target=lambda: result.update(out=mon.maintenance("clear_errors", timeout_s=5.0))
+    )
+    t.start()
+    wait_until(lambda: "clean_error" in raw.call_names(), msg="first write never issued")
+    # A short join timeout: the op is mid-write, so the shutdown extends its wait.
+    assert mon.disconnect(timeout=0.05) is True
+    t.join(3.0)
+    out = result["out"]
+    assert out.ok, out.detail
+    assert out.detail == (
+        "cleared controller error 19: End Effector Communication Error "
+        "(monitor paused: released for hand-over before the read-back)"
+    )
+    assert list(out.sdk_codes) == ["clean_error", "clean_warn"]
+    assert out.before is not None and out.after is None
+    names = raw.call_names()
+    assert names.index("clean_warn") < names.index("disconnect")  # released AFTER the op
+    assert mon.maintenance_busy is False
+    assert mon.status == "paused" and raw.connected is False

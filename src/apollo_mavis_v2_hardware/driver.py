@@ -107,6 +107,19 @@ class _StateSnap:
     wallclock_ns: int
 
 
+@dataclass(frozen=True)
+class RecoveryResult:
+    """Outcome of the last recovery sequence (auto or user-initiated); readable
+    without consuming the event stream (``XArmDriver.recovery_result()``)."""
+
+    seq: int  # increases with every completed sequence
+    ok: bool  # True: streaming resumed (RecoveredEvent emitted); False: LATCHED
+    error_code: int  # controller error captured at the start of the sequence
+    detail: str = ""  # latch reason when not ok
+    user_initiated: bool = False
+    t_mono: float = 0.0
+
+
 class _ServoStreamer:
     """Dedicated 100 Hz mode-1 streaming thread for one arm (§3.3).
 
@@ -312,6 +325,10 @@ class XArmDriver(ArmInterface):
         self._c24_backoff_until: float | None = None
         self._fault_pending = False
         self._fault_code = 0
+        self._fault_source = "user"
+        self._user_recovery_pending = False  # request_recovery() -> monitor thread
+        self._recovery_seq = 0
+        self._recovery_result: RecoveryResult | None = None
         self._latch_reason = ""
         self._was_stale = True
         self._external_retry_at: float | None = None
@@ -363,10 +380,19 @@ class XArmDriver(ArmInterface):
         return list(self._connect_warnings)
 
     def drain_events(self) -> list[DriverEvent]:
+        """Bounded-deque pickup of every DriverEvent (FaultEvent / RecoveredEvent /
+        ReseedEvent / StudioConflictWarning / RailEvent / GripperFaultEvent /
+        StaleEvent) since the previous call; the runtime drains once per tick."""
         with self._events_lock:
             out = list(self._events)
             self._events.clear()
         return out
+
+    def recovery_result(self) -> RecoveryResult | None:
+        """Outcome of the most recent recovery sequence (None before the first);
+        lets a waiter (REST) observe success/latch without draining the events
+        the control loop consumes."""
+        return self._recovery_result
 
     def _emit(self, event: DriverEvent) -> None:
         with self._events_lock:
@@ -605,7 +631,7 @@ class XArmDriver(ArmInterface):
             now = self._clock()
             self._phase = DriverPhase.RECOVERING
             self._fault_pending = False
-            source = getattr(self, "_fault_source", "user")
+            source = "user" if user_initiated else self._fault_source
             code, ew = api.get_err_warn_code()
             err, warn = (int(ew[0]), int(ew[1])) if code == 0 and ew else (0, 0)
             self._err_code, self._warn_code = err, warn
@@ -626,20 +652,25 @@ class XArmDriver(ArmInterface):
             if not user_initiated:
                 if kind == FaultKind.UNRECOVERABLE:
                     self._latch(f"controller error {err}", emit=False)
+                    self._record_recovery(err, user_initiated)
                     return
                 if kind == FaultKind.EXTERNAL:
                     self._handle_external(resume_from_fault=True)
+                    self._record_recovery(err, user_initiated)
                     return
                 if kind == FaultKind.RECOVERABLE and not self._budget_ok(now, err):
+                    self._record_recovery(err, user_initiated)
                     return  # _budget_ok latched already
             # steps 3-6: the binding recovery sequence
             api.clean_error()
             api.clean_warn()
             if api.motion_enable(True) != 0:
                 self._latch("motion_enable failed (release the physical e-stop?)")
+                self._record_recovery(err, user_initiated)
                 return
             if api.set_mode(1) != 0 or api.set_state(0) != 0:
                 self._latch("set_mode/set_state failed during recovery")
+                self._record_recovery(err, user_initiated)
                 return
             self._mode_set_at = self._clock()
             self._sleep(0.1)
@@ -647,6 +678,7 @@ class XArmDriver(ArmInterface):
                 q = self._read_measured_q()
             except ArmConnectError:
                 self._latch("could not read measured position during recovery")
+                self._record_recovery(err, user_initiated)
                 return
             self._streamer.reseed(q)
             self._streamer.resume()
@@ -660,6 +692,20 @@ class XArmDriver(ArmInterface):
             self._err_code, self._warn_code = 0, warn
             self._phase = DriverPhase.STREAMING
             self._emit(RecoveredEvent(self.cfg.arm_id, err, t_mono=now))
+            self._record_recovery(err, user_initiated)
+
+    def _record_recovery(self, err: int, user_initiated: bool) -> None:
+        """Publish the outcome of the sequence that just ended (ok = streaming again)."""
+        self._recovery_seq += 1
+        ok = self._phase == DriverPhase.STREAMING
+        self._recovery_result = RecoveryResult(
+            seq=self._recovery_seq,
+            ok=ok,
+            error_code=err,
+            detail="" if ok else self._latch_reason,
+            user_initiated=user_initiated,
+            t_mono=self._clock(),
+        )
 
     def _budget_ok(self, now: float, err: int) -> bool:
         """<= 3 recoveries per rolling 30 s; a second C24 inside the backoff
@@ -748,17 +794,49 @@ class XArmDriver(ArmInterface):
         self._latch("user_stop")
 
     def clear_errors(self) -> None:
-        """User-initiated recovery; only meaningful from LATCHED (§3.5). With
-        the physical e-stop still engaged, motion_enable fails and the driver
-        stays LATCHED."""
+        """User-initiated recovery on the CALLER's thread; only meaningful from
+        LATCHED (§3.5). With the physical e-stop still engaged, motion_enable
+        fails and the driver stays LATCHED. Prefer :meth:`request_recovery`
+        from other threads (one XArmAPI must not be driven from two threads)."""
         if self._phase not in (DriverPhase.LATCHED, DriverPhase.FAULT):
             return
-        self._recovery_times.clear()  # explicit user action resets the budget
+        self._reset_recovery_budget()
+        self._recover(user_initiated=True)
+
+    def request_recovery(self) -> None:
+        """Operator-triggered recovery (phase-09b): flag it; the 5 Hz monitor
+        thread runs ``_recover(user_initiated=True)`` — clean_error, clean_warn,
+        motion_enable, set_mode(1), set_state(0), re-seed from the MEASURED
+        position — bypassing classification and the budget. The outcome arrives
+        as FaultEvent -> ReseedEvent + RecoveredEvent (or a latch FaultEvent) via
+        :meth:`drain_events` and as :meth:`recovery_result`. Works from any
+        connected phase (LATCHED / FAULT / STREAMING); never runs SDK calls on the
+        caller's thread. Raises ``CommandError`` when the driver is not connected."""
+        if self._api is None or self._monitor is None:
+            raise CommandError(f"{self.cfg.arm_id}: driver not connected")
+        with self._phase_lock:
+            self._user_recovery_pending = True
+
+    def _reset_recovery_budget(self) -> None:
+        """An explicit user action resets the auto-recovery budget and C24 backoff."""
+        self._recovery_times.clear()
         self._c24_backoff_until = None
         if self._streamer is not None:
             self._streamer.set_scale(1.0)
         self._external_retry_at = None
-        self._recover(user_initiated=True)
+
+    def _user_recover(self) -> None:
+        """Monitor-thread half of :meth:`request_recovery`."""
+        if self._api is None:
+            return
+        self._reset_recovery_budget()
+        if self._streamer is not None:
+            self._streamer.pause()  # the sequence re-seeds and resumes it
+        try:
+            self._recover(user_initiated=True)
+        except Exception as exc:  # noqa: BLE001 — the SDK raises bare Exception
+            self._latch(f"recovery failed: {type(exc).__name__}: {exc}".rstrip(": "))
+            self._record_recovery(self._err_code, user_initiated=True)
 
     def disconnect(self) -> None:
         """Idempotent teardown; never raises (logs by returning silently)."""
@@ -819,7 +897,13 @@ class _MonitorThread:
         api = d._api
         if api is None:
             return
-        # 0. pending fault -> run recovery here (streamer already paused)
+        # 0. operator-requested recovery first (request_recovery), then a
+        #    pending auto fault -> both run HERE (streamer already paused)
+        with d._phase_lock:
+            user_pending, d._user_recovery_pending = d._user_recovery_pending, False
+        if user_pending:
+            d._user_recover()
+            return
         if d._fault_pending and d._phase == DriverPhase.FAULT:
             d._recover()
             return

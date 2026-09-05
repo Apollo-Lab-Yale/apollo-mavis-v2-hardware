@@ -10,6 +10,7 @@ from typing import Any, Literal
 from apollo_mavis_v2_core import (
     ArmState,
     BringupError,
+    CommandError,
     WorkcellBringupError,
     WorkcellConfig,
 )
@@ -18,7 +19,8 @@ from pydantic import BaseModel, Field
 
 from .cameras import make_camera
 from .config import XArmDriverConfig
-from .driver import XArmDriver
+from .driver import RecoveryResult, XArmDriver
+from .events import DriverEvent
 from .netsetup import NetSetup
 
 BOOT_POLL_PERIOD_S = 2.0  # 502 poll while the control box boots (~1-2 min)
@@ -39,7 +41,18 @@ class ArmBringupStatus(BaseModel):
     error: str | None = None
 
 
+# core ArmConfig fields forwarded verbatim when present (phase-09b adds them to
+# core in parallel; an older core without them keeps the XArmDriverConfig defaults:
+# sensitivity 3, no reduced-mode boundary, no SN check)
+_OPTIONAL_ARM_FIELDS = ("collision_sensitivity", "reduced_tcp_boundary_mm", "expected_sn")
+
+
 def _driver_cfg(arm: Any) -> XArmDriverConfig:
+    """core ``ArmConfig`` -> ``XArmDriverConfig``: identity, rail/gripper and the
+    controller-side backstop parameters (02-hardware §6) all come from the workcell
+    config, so the driver's connect-time ``apply_backstops`` and the monitor's
+    ``apply_backstops`` maintenance op write the same values."""
+    optional = {name: getattr(arm, name) for name in _OPTIONAL_ARM_FIELDS if hasattr(arm, name)}
     return XArmDriverConfig(
         arm_id=arm.id,
         ip=arm.ip,
@@ -47,6 +60,7 @@ def _driver_cfg(arm: Any) -> XArmDriverConfig:
         gripper=arm.gripper,
         tcp_load_kg=arm.tcp_load_kg,
         tcp_load_cog_mm=arm.tcp_load_cog_mm,
+        **optional,
     )
 
 
@@ -99,6 +113,37 @@ class HardwareWorkcell(WorkcellInterface):
 
     def states(self) -> dict[str, ArmState]:
         return {arm_id: arm.get_state() for arm_id, arm in self.arms.items()}
+
+    # -- events / recovery (phase-09b) ----------------------------------------------
+    def drain_events(self) -> list[DriverEvent]:
+        """Every driver's pending DriverEvents since the previous call (FaultEvent,
+        RecoveredEvent, ReseedEvent, StudioConflictWarning, RailEvent, ...), in
+        ``t_mono`` order (stable: per-arm order is kept). The runtime drains this
+        once per control tick."""
+        events: list[DriverEvent] = []
+        for arm in self.arms.values():
+            drain = getattr(arm, "drain_events", None)
+            if drain is not None:
+                events.extend(drain())
+        events.sort(key=lambda e: getattr(e, "t_mono", 0.0))
+        return events
+
+    def request_recovery(self, arm_id: str) -> None:
+        """Operator-triggered recovery of one arm (``XArmDriver.request_recovery``):
+        executed on that driver's monitor thread; outcome via :meth:`drain_events`
+        (RecoveredEvent / latch FaultEvent) and :meth:`recovery_result`. Unknown arm
+        -> ``KeyError``; a driver without the channel -> ``CommandError``."""
+        arm = self.arms[arm_id]
+        request = getattr(arm, "request_recovery", None)
+        if request is None:
+            raise CommandError(f"{arm_id}: driver has no recovery channel")
+        request()
+
+    def recovery_result(self, arm_id: str) -> RecoveryResult | None:
+        """Most recent recovery outcome of one arm (None before the first)."""
+        arm = self.arms[arm_id]
+        getter = getattr(arm, "recovery_result", None)
+        return getter() if getter is not None else None
 
     # -- cameras ------------------------------------------------------------------
     def start_cameras(self) -> None:

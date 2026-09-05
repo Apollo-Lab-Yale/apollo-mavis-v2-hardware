@@ -1,15 +1,18 @@
 """HardwareWorkcell bring-up: parallel arms, partial failure, statuses (§9)."""
 
 import time
+from types import SimpleNamespace
 
 import pytest
-from apollo_mavis_v2_core import WorkcellBringupError
+from apollo_mavis_v2_core import CommandError, WorkcellBringupError
 from apollo_mavis_v2_core.schemas import ArmConfig, PoseModel, WorkcellConfig
 from fakes.fake_xarm_api import FakeXArmAPI
+from test_driver_connect import wait_until
 
-from apollo_mavis_v2_hardware.driver import XArmDriver
+from apollo_mavis_v2_hardware.driver import DriverPhase, XArmDriver
+from apollo_mavis_v2_hardware.events import FaultEvent, RecoveredEvent, ReseedEvent
 from apollo_mavis_v2_hardware.netsetup.types import MatchResult
-from apollo_mavis_v2_hardware.workcell import ArmBringupStatus, HardwareWorkcell
+from apollo_mavis_v2_hardware.workcell import ArmBringupStatus, HardwareWorkcell, _driver_cfg
 
 
 def _wc_config(n_arms=2) -> WorkcellConfig:
@@ -165,3 +168,95 @@ def test_driver_connect_warnings_reach_bringup_status():
         assert not any("get_linear_track_sn" in w for w in statuses["arm1"].warnings)
     finally:
         wc.shutdown()
+
+
+# -- phase-09b: backstop parameters from ArmConfig, events, recovery ----------------------
+
+
+def test_driver_cfg_maps_backstop_parameters_from_arm_config():
+    arm = ArmConfig(
+        id="grip",
+        ip="192.168.1.201",
+        base_in_world=PoseModel(),
+        gripper="xarm_g2",
+        tcp_load_kg=0.95,
+        tcp_load_cog_mm=(0.0, 0.0, 60.0),
+    )
+    cfg = _driver_cfg(arm)
+    assert cfg.arm_id == "grip" and cfg.ip == "192.168.1.201" and cfg.gripper == "xarm_g2"
+    assert cfg.tcp_load_kg == 0.95 and cfg.tcp_load_cog_mm == (0.0, 0.0, 60.0)
+    if not hasattr(arm, "collision_sensitivity"):
+        # core without the phase-09b fields: the driver defaults apply
+        assert cfg.collision_sensitivity == 3
+        assert cfg.reduced_tcp_boundary_mm is None and cfg.expected_sn is None
+    # the phase-09b ArmConfig fields are forwarded verbatim (duck-typed here so the
+    # test holds both before and after core gains them)
+    arm09b = SimpleNamespace(
+        id="view",
+        ip="192.168.2.219",
+        expect_rail="auto",
+        gripper="none",
+        tcp_load_kg=0.55,
+        tcp_load_cog_mm=(0.0, 0.0, 90.0),
+        collision_sensitivity=4,
+        reduced_tcp_boundary_mm=(700, -700, 600, -600, 800, 0),
+        expected_sn="XS1305",
+    )
+    cfg = _driver_cfg(arm09b)
+    assert cfg.collision_sensitivity == 4
+    assert cfg.reduced_tcp_boundary_mm == (700, -700, 600, -600, 800, 0)
+    assert cfg.expected_sn == "XS1305"
+    assert cfg.tcp_load_kg == 0.55 and cfg.gripper == "none"
+    with pytest.raises(ValueError):  # ArmConfig-style bound (0..5) enforced on the driver side
+        _driver_cfg(SimpleNamespace(**{**vars(arm09b), "collision_sensitivity": 6}))
+
+
+def _events_until(wc, pred, timeout=5.0):
+    events = []
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        events.extend(wc.drain_events())
+        if pred(events):
+            return events
+        time.sleep(0.005)
+    raise AssertionError(f"predicate never satisfied; events={events}")
+
+
+def test_drain_events_aggregates_all_drivers_and_request_recovery_targets_one_arm():
+    wc, apis = make_workcell()
+    try:
+        wc.bring_up(timeout_s=20.0)
+        time.sleep(0.05)
+        wc.drain_events()  # bring-up chatter (stale transitions, rail phases)
+        apis["arm1"].inject_error(1)  # e-stop on arm1 only
+        events = _events_until(
+            wc, lambda evs: any(isinstance(e, FaultEvent) and e.arm_id == "arm1" for e in evs)
+        )
+        assert all(e.arm_id in ("arm1", "arm2") for e in events)
+        assert not any(isinstance(e, FaultEvent) and e.arm_id == "arm2" for e in events)
+        assert [e.t_mono for e in events] == sorted(e.t_mono for e in events)  # timeline order
+        wait_until(lambda: wc.arms["arm1"].phase is DriverPhase.LATCHED)
+        assert wc.arms["arm2"].phase is DriverPhase.STREAMING  # sibling untouched
+        assert wc.recovery_result("arm1") is not None and not wc.recovery_result("arm1").ok
+        wc.request_recovery("arm1")
+        events = _events_until(
+            wc, lambda evs: any(isinstance(e, RecoveredEvent) and e.arm_id == "arm1" for e in evs)
+        )
+        assert any(isinstance(e, ReseedEvent) and e.arm_id == "arm1" for e in events)
+        assert not any(e.arm_id == "arm2" and isinstance(e, RecoveredEvent) for e in events)
+        assert wc.arms["arm1"].phase is DriverPhase.STREAMING
+        assert wc.recovery_result("arm1").ok and wc.recovery_result("arm1").user_initiated
+        assert wc.recovery_result("arm2") is None  # never recovered
+        with pytest.raises(KeyError):
+            wc.request_recovery("nope")
+    finally:
+        wc.shutdown()
+
+
+def test_request_recovery_on_a_driver_without_the_channel_raises_command_error():
+    wc, _ = make_workcell(n_arms=1)
+    wc.arms["arm1"] = SimpleNamespace(get_state=lambda: None)  # foreign ArmInterface impl
+    assert wc.drain_events() == []
+    assert wc.recovery_result("arm1") is None
+    with pytest.raises(CommandError):
+        wc.request_recovery("arm1")

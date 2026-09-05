@@ -93,6 +93,8 @@ class FakeXArmAPI:
         motion_enable_fails: bool = False,
         connect_fails: int = 0,
         connect_delay_s: float = 0.0,
+        collision_sensitivity: int = 0,
+        tcp_load: tuple[float, tuple[float, float, float]] = (0.0, (0.0, 0.0, 0.0)),
         clock: Callable[[], float] = time.monotonic,
         **kwargs: Any,
     ) -> None:
@@ -120,6 +122,11 @@ class FakeXArmAPI:
         self.motion_enabled = False
         self.motion_enable_fails = motion_enable_fails
         self.joints_torque = [0.0] * 7
+        # SDK 1.18.5: read-only PROPERTIES refreshed by the report thread from the
+        # normal/rich frame (no get_tcp_load / get_collision_sensitivity exist);
+        # the lab boxes read 0 kg / sensitivity 3 (grip) and 1 (view) on 2026-09-04
+        self.collision_sensitivity = int(collision_sensitivity)
+        self.tcp_load: list[Any] = [float(tcp_load[0]), [float(v) for v in tcp_load[1]]]
         self._q = list(initial_q) if initial_q is not None else [0.0] * 7
         self._tcp = (
             list(initial_tcp) if initial_tcp is not None else [207.0, 0.0, 112.0, math.pi, 0.0, 0.0]
@@ -277,16 +284,19 @@ class FakeXArmAPI:
         return 0
 
     # -- backstops (§6) ---------------------------------------------------------------
-    def set_tcp_load(self, weight: float, cog: list[float]) -> int:
+    def set_tcp_load(self, weight: float, cog: list[float], wait: bool = False, **kw: Any) -> int:
         self._rec("set_tcp_load", weight, tuple(cog))
+        # the controller echoes the new load in the next report frame
+        self.tcp_load = [float(weight), [float(v) for v in cog]]
         return 0
 
-    def set_gravity_direction(self, direction: list[float]) -> int:
+    def set_gravity_direction(self, direction: list[float], wait: bool = True) -> int:
         self._rec("set_gravity_direction", tuple(direction))
         return 0
 
     def set_collision_sensitivity(self, value: int, wait: bool = True) -> int:
         self._rec("set_collision_sensitivity", value)
+        self.collision_sensitivity = int(value)
         return 0
 
     def set_self_collision_detection(self, on: bool) -> int:
@@ -305,9 +315,9 @@ class FakeXArmAPI:
         self._rec("set_reduced_mode", on)
         return 0
 
-    def set_collision_rebound(self, on: bool) -> int:
+    def set_collision_rebound(self, on: bool) -> list[int]:
         self._rec("set_collision_rebound", on)
-        return 0
+        return [0, 0]  # SDK 1.18.5 returns the raw reply list here, not ret[0]
 
     def save_conf(self) -> int:  # the driver must NEVER call this
         self._rec("save_conf")

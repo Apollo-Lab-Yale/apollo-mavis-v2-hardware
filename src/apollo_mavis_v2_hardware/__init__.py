@@ -3,13 +3,14 @@
 Implements core's ArmInterface/CameraInterface/WorkcellInterface over the
 xArm-Python-SDK (pinned 1.18.5), plus NetworkManager auto-matching (netsetup),
 V4L2/RealSense camera backends and a read-only controller state monitor
-(``ArmStateMonitor``, phase-09a). Depends only on apollo-mavis-v2-core.
+(``ArmStateMonitor``, phase-09a) with an explicit operator maintenance channel
+(``maintenance()``, phase-09b). Depends only on apollo-mavis-v2-core.
 """
 
 from . import units
-from .backstops import apply_backstops
+from .backstops import BACKSTOP_SDK_METHODS, apply_backstops, expected_backstop_sequence
 from .config import ServoLimits, XArmDriverConfig
-from .driver import ArmFaultedError, DriverPhase, XArmDriver
+from .driver import ArmFaultedError, DriverPhase, RecoveryResult, XArmDriver
 from .events import (
     DriverEvent,
     FaultEvent,
@@ -24,11 +25,15 @@ from .events import (
 )
 from .grippers import ClassicGripper, G2Gripper, GripperBackend, NoGripper, make_gripper
 from .monitor import (
+    MAINTENANCE_OPS,
+    MAINTENANCE_SDK_METHODS,
     READ_ONLY_SDK_ATTRS,
     READ_ONLY_SDK_METHODS,
     ArmMonitorSample,
     ArmMonitorStatus,
     ArmStateMonitor,
+    MaintenanceOp,
+    MaintenanceOutcome,
     controller_error_title,
 )
 from .netsetup import ArmNet, NetSetup
@@ -46,7 +51,10 @@ __all__ = [
     "ServoLimits",
     "DriverPhase",
     "ArmFaultedError",
+    "RecoveryResult",
     "apply_backstops",
+    "expected_backstop_sequence",
+    "BACKSTOP_SDK_METHODS",
     # events
     "DriverEvent",
     "FaultEvent",
@@ -66,10 +74,14 @@ __all__ = [
     "make_gripper",
     "RailController",
     "RailPhase",
-    # read-only monitor (phase-09a)
+    # read-only monitor (phase-09a) + maintenance channel (phase-09b)
     "ArmStateMonitor",
     "ArmMonitorSample",
     "ArmMonitorStatus",
+    "MaintenanceOp",
+    "MaintenanceOutcome",
+    "MAINTENANCE_OPS",
+    "MAINTENANCE_SDK_METHODS",
     "READ_ONLY_SDK_METHODS",
     "READ_ONLY_SDK_ATTRS",
     "controller_error_title",
