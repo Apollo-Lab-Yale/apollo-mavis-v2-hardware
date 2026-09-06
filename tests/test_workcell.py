@@ -4,7 +4,7 @@ import time
 from types import SimpleNamespace
 
 import pytest
-from apollo_mavis_v2_core import CommandError, WorkcellBringupError
+from apollo_mavis_v2_core import BringupError, CommandError, WorkcellBringupError
 from apollo_mavis_v2_core.schemas import ArmConfig, PoseModel, WorkcellConfig
 from fakes.fake_xarm_api import FakeXArmAPI
 from test_driver_connect import wait_until
@@ -12,6 +12,7 @@ from test_driver_connect import wait_until
 from apollo_mavis_v2_hardware.driver import DriverPhase, XArmDriver
 from apollo_mavis_v2_hardware.events import FaultEvent, RecoveredEvent, ReseedEvent
 from apollo_mavis_v2_hardware.netsetup.types import MatchResult
+from apollo_mavis_v2_hardware.rail import RailNotHomedError
 from apollo_mavis_v2_hardware.workcell import ArmBringupStatus, HardwareWorkcell, _driver_cfg
 
 
@@ -31,7 +32,13 @@ def _fast_sleep(s: float) -> None:
     time.sleep(min(s, 0.01))
 
 
-def make_workcell(fail_arms=frozenset(), netsetup=None, n_arms=2, api_cls=FakeXArmAPI):
+def make_workcell(
+    fail_arms=frozenset(),
+    netsetup=None,
+    n_arms=2,
+    api_cls=FakeXArmAPI,
+    unhomed_arms=frozenset(),
+):
     apis: dict[str, FakeXArmAPI] = {}
 
     def driver_factory(cfg):
@@ -40,7 +47,7 @@ def make_workcell(fail_arms=frozenset(), netsetup=None, n_arms=2, api_cls=FakeXA
                 ip,
                 auto_report_hz=100.0,
                 has_rail=(cfg.arm_id == "arm2"),
-                rail_homed=True,
+                rail_homed=cfg.arm_id not in unhomed_arms,
                 **kw,
             )
             if cfg.arm_id in fail_arms:
@@ -61,7 +68,8 @@ def test_bring_up_all_arms_and_states():
         statuses = wc.bring_up(status_cb=transitions.append, timeout_s=20.0)
         assert statuses["arm1"].connected and statuses["arm2"].connected
         assert statuses["arm1"].rail == "none"
-        assert statuses["arm2"].rail == "ready"  # detected + homed during connect
+        assert statuses["arm2"].rail == "ready"  # detected + already homed (connect never homes)
+        assert apis["arm2"].homing_started == 0
         assert statuses["arm1"].gripper == "xarm"
         assert statuses["arm1"].sn == "XA7-FAKE-0001"
         assert transitions, "status_cb never fired"
@@ -87,6 +95,92 @@ def test_one_arm_failing_never_aborts_the_others():
         assert exc_info.value.statuses["arm1"] is None
     finally:
         wc.shutdown()
+
+
+def test_unhomed_rail_maps_to_status_unhomed_and_bring_up_never_homes():
+    """Phase-09c: the lab tracks are unhomed at power-on. The arm with the rail
+    fails its connect with RailNotHomedError -> rail 'unhomed' (not 'error'),
+    NOTHING is written to the track, the sibling arm is untouched, and start()
+    surfaces the typed error so the session layer refuses."""
+    wc, apis = make_workcell(unhomed_arms={"arm2"})
+    try:
+        transitions: list[ArmBringupStatus] = []
+        statuses = wc.bring_up(status_cb=transitions.append, timeout_s=20.0)
+        assert statuses["arm1"].connected and statuses["arm1"].rail == "none"
+        s2 = statuses["arm2"]
+        assert not s2.connected and s2.rail == "unhomed"
+        assert s2.error is not None and "not homed" in s2.error and "arm2" in s2.error
+        names = apis["arm2"].call_names()
+        assert "set_linear_track_back_origin" not in names  # never homes
+        assert "set_linear_track_enable" not in names and "set_linear_track_speed" not in names
+        assert apis["arm2"].homing_started == 0 and apis["arm2"].rail_homed is False
+        assert not any(t.rail == "homing" for t in transitions)  # the value no longer exists
+        with pytest.raises(WorkcellBringupError) as exc_info:
+            wc.start()
+        assert isinstance(exc_info.value.statuses["arm2"], RailNotHomedError)
+        assert exc_info.value.statuses["arm2"].step == "rail"
+        assert exc_info.value.statuses["arm1"] is None
+    finally:
+        wc.shutdown()
+    # shutdown handed arm1 back stopped + braked (D6) and left arm2's track alone
+    assert apis["arm1"].motion_enabled is False and apis["arm1"].state == 4
+    assert apis["arm2"].rail_homed is False and apis["arm2"].homing_started == 0
+
+
+class _TrackDropsAfterDetect(FakeXArmAPI):
+    """The gate register read (2nd call) times out: carriage position unverifiable."""
+
+    def get_linear_track_registers(self, **kwargs):
+        code, regs = super().get_linear_track_registers(**kwargs)
+        if self.call_names().count("get_linear_track_registers") >= 2:
+            return 3, {}
+        return code, regs
+
+
+def test_unverifiable_rail_maps_to_status_error_with_error_set_and_no_enable():
+    """Phase-09c review fix: a failed gate register read is a per-arm bring-up
+    ERROR (rail 'error' + error + not connected) - never a connected arm whose
+    rail silently reports 0.0 m; and the arm was never enabled."""
+    wc, apis = make_workcell(api_cls=_TrackDropsAfterDetect)
+    try:
+        statuses = wc.bring_up(timeout_s=20.0)
+        assert statuses["arm1"].connected and statuses["arm1"].rail == "none"
+        s2 = statuses["arm2"]
+        assert not s2.connected and s2.rail == "error"
+        assert s2.error is not None and "get_linear_track_registers failed" in s2.error
+        assert "arm2" in s2.error and "carriage position unverifiable" in s2.error
+        api2 = apis["arm2"]
+        assert ("motion_enable", (True,), {}) not in api2.calls and api2.motion_enabled is False
+        assert [n for n in api2.call_names() if n.startswith("set_linear_track")] == []
+        with pytest.raises(WorkcellBringupError) as exc_info:
+            wc.start()
+        err = exc_info.value.statuses["arm2"]
+        assert isinstance(err, BringupError) and not isinstance(err, RailNotHomedError)
+        assert err.step == "rail" and exc_info.value.statuses["arm1"] is None
+    finally:
+        wc.shutdown()
+
+
+def test_arm_bringup_status_rail_literal_has_unhomed_not_homing():
+    assert ArmBringupStatus(arm_id="a", rail="unhomed").rail == "unhomed"
+    with pytest.raises(ValueError):
+        ArmBringupStatus(arm_id="a", rail="homing")
+
+
+def test_subset_config_builds_only_the_selected_drivers():
+    """A session WorkcellConfig restricted to one arm (phase-09c first live run:
+    Manipulation Arm only) must not construct — let alone connect — the other."""
+    full = _wc_config(2)
+    subset = full.model_copy(update={"arms": [a for a in full.arms if a.id == "arm1"]})
+    built: list[str] = []
+
+    def driver_factory(cfg):
+        built.append(cfg.arm_id)
+        return XArmDriver(cfg, api_factory=lambda ip, **kw: FakeXArmAPI(ip, **kw))
+
+    wc = HardwareWorkcell(subset, driver_factory=driver_factory)
+    assert built == ["arm1"] and set(wc.arms) == {"arm1"}
+    assert wc.cfg.arms[0].id == "arm1" and len(wc.cfg.arms) == 1
 
 
 def test_netsetup_none_skips_network_stage_with_warning():

@@ -11,7 +11,9 @@ from apollo_mavis_v2_hardware.config import ServoLimits
 from apollo_mavis_v2_hardware.driver import _ServoStreamer
 
 DT = 0.01
-LIMITS = ServoLimits()  # vel 1.0 rad/s, acc 20 rad/s^2, cart step 9 mm
+# the algorithm pins below assume vel 1.0 rad/s, acc 20 rad/s^2, cart step 9 mm
+# (the pre-phase-09c defaults; ServoLimits() now defaults to the D2 caps 0.3 / 2 mm)
+LIMITS = ServoLimits(max_joint_vel=(1.0,) * 7, max_cart_step_m=0.009)
 VEL_STEP = 1.0 * DT
 ACC_STEP = 20.0 * DT * DT
 LEVER = np.array(LIMITS.lever_arm_m)

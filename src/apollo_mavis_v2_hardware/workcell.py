@@ -22,20 +22,32 @@ from .config import XArmDriverConfig
 from .driver import RecoveryResult, XArmDriver
 from .events import DriverEvent
 from .netsetup import NetSetup
+from .rail import RailNotHomedError
 
 BOOT_POLL_PERIOD_S = 2.0  # 502 poll while the control box boots (~1-2 min)
 FRESH_REPORT_TIMEOUT_S = 5.0  # one fresh 30003 snapshot required before "connected"
 
 
 class ArmBringupStatus(BaseModel):
-    """Streamed to the UI landing page via status_cb on every transition."""
+    """Streamed to the UI landing page via status_cb on every transition.
+
+    ``rail == "unhomed"`` (phase-09c): the track was detected but ``on_zero == 0``.
+    With the default ``rail_homing == "require_homed"`` the driver refused to
+    connect (it never homes; ``RailNotHomedError``, ``connected False`` +
+    ``error``) — the session layer refuses and the operator homes from the
+    Hardware tab. With ``rail_homing == "allow_unhomed"`` (phase-09d, the
+    runtime's rail-homing maintenance motion only) the arm IS connected
+    (``connected True``, no ``error``) and the rail stays ``unhomed`` — its
+    position is unknown until ``XArmDriver.home_rail()`` succeeds. There is no
+    ``homing`` value: bring-up never homes.
+    """
 
     arm_id: str
     network: Literal["pending", "probing", "ok", "booting", "failed"] = "pending"
     connected: bool = False
     fw_version: str | None = None
     sn: str | None = None
-    rail: Literal["unknown", "none", "detected", "homing", "ready", "error"] = "unknown"
+    rail: Literal["unknown", "none", "detected", "unhomed", "ready", "error"] = "unknown"
     gripper: Literal["unknown", "xarm", "xarm_g2", "none", "error"] = "unknown"
     warnings: list[str] = Field(default_factory=list)
     error: str | None = None
@@ -176,9 +188,19 @@ class HardwareWorkcell(WorkcellInterface):
 
         Sequence per §9: (1) netsetup verify -> match on miss; probe "refused"
         means the box is booting — poll TCP 502 every 2 s, never re-probe NICs;
-        (2) connect each arm in its own thread; (3) rail detect+home inside
-        connect; (4) require one fresh 30003 snapshot before "connected";
-        (5) start cameras (independent, idempotent).
+        (2) connect each arm in its own thread; (3) rail detect + REQUIRE homed
+        inside connect, BEFORE the arm is enabled — bring-up never homes
+        (phase-09c): an unhomed track is ``rail: "unhomed"`` + error, a track
+        whose registers cannot be read / enabled is ``rail: "error"`` + error,
+        and in both cases the arm stays unconnected (brakes engaged, never
+        enabled) until the operator runs the monitor's ``home_rail`` op or the
+        track is fixed — except when the driver config says ``rail_homing:
+        "allow_unhomed"`` (phase-09d maintenance motion): then the arm connects
+        with ``rail: "unhomed"`` and NO error, position unknown until
+        ``XArmDriver.home_rail()``; (4) require one fresh
+        30003 snapshot before "connected"; (5) start cameras (independent,
+        idempotent). Only the arms in ``cfg.arms`` get a driver, so a subset
+        session config brings up a subset.
         """
         deadline = time.monotonic() + timeout_s
         self._stopped = False
@@ -274,7 +296,9 @@ class HardwareWorkcell(WorkcellInterface):
             status.error = str(exc)
             if exc.step == "gripper":
                 status.gripper = "error"
-            if exc.step == "rail":
+            if isinstance(exc, RailNotHomedError):
+                status.rail = "unhomed"  # detected, on_zero == 0: never homed here
+            elif exc.step == "rail":
                 status.rail = "error"
             self._bringup_errors[arm_id] = exc
             push(status)
@@ -286,7 +310,12 @@ class HardwareWorkcell(WorkcellInterface):
         status.gripper = getattr(driver, "gripper_kind", "unknown")
         if driver.has_rail:
             rail_phase = getattr(driver, "rail_phase", None)
-            status.rail = "ready" if rail_phase in (None, "READY") else "error"
+            if rail_phase in (None, "READY"):
+                status.rail = "ready"
+            elif rail_phase == "DETECTED":
+                status.rail = "unhomed"  # connected with rail_homing == "allow_unhomed" (09d)
+            else:
+                status.rail = "error"
         else:
             status.rail = "none"
         push(status)

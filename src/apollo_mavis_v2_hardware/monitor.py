@@ -17,12 +17,37 @@ the complete list of ``XArmAPI`` members the polling touches;
 ``MAINTENANCE_SDK_METHODS`` is the complete per-operation write set of
 :meth:`ArmStateMonitor.maintenance` — ``clear_errors`` = ``clean_error`` +
 ``clean_warn`` (no enable: nothing moves, brakes stay engaged),
-``apply_backstops`` = exactly the ``backstops.apply_backstops`` sequence.
+``apply_backstops`` = exactly the ``backstops.apply_backstops`` sequence,
+``home_rail`` (phase-09c) = ``set_linear_track_back_origin`` +
+``set_linear_track_enable`` + ``set_linear_track_speed`` — **the ONE
+maintenance op that moves a mechanical part**: the carriage drives to the
+track's zero end. It is operator-triggered, twin-gated by the runtime (a
+full-travel sweep at the arm's CURRENT posture) and session-less; the request
+carries the posture the sweep assumed and the op refuses, before any write,
+when the arm has moved or a controller error is latched. ``motion_enable`` is
+never part of it (the track is a separate RS-485 axis; the arm stays braked).
 ``recover`` (enable + servo mode) needs a session driver and is refused here.
 Maintenance requests are queued and executed ON THE POLL THREAD (one
 ``XArmAPI`` is never used from two threads); the caller only waits.
 ``tests/test_monitor.py`` runs all of it against a call-logging fake and
 asserts nothing else is ever called.
+
+``home_rail`` and SDK 1.18.5 (``x3/linear_motor.py:131-148``, verified):
+``set_linear_motor_back_origin(wait, **kwargs)`` reads ``auto_enable``
+(default True) and ``timeout`` (default 10 s) from kwargs; with ``wait`` it
+polls the registers until ``on_zero == 1`` (0), track ``error != 0`` (80),
+``sci == 0`` (81), 10 consecutive read failures (101) or the timeout (100) — and
+the loop also exits with 100 as soon as ``api.connected`` drops. Then, if
+``auto_enable``, it OVERWRITES that result with ``set_linear_motor_enable(True)``'s
+return code, so a timed-out homing can come back as 0. The monitor therefore
+passes ``auto_enable=False``, enables + sets the speed itself, and judges ONLY
+from the after-sample registers (``on_zero == 1 and is_enabled == 1 and
+error == 0``), never from the return codes (kept in ``sdk_codes`` for
+diagnosis). While the op runs the poll thread is inside the SDK wait: no new
+sample is published, the arm's status reads ``stale`` and ``maintenance_busy``
+is true — expected, the UI shows "homing". ``stop()``/``disconnect()`` wait
+for an in-flight ``home_rail`` (up to ``HOME_RAIL_TIMEOUT_S``) instead of
+pulling the client out from under the wait loop.
 
 SDK 1.18.5 side effects a read-only caller cannot avoid (verified in the
 pinned source; relevant to "state/mode/error unchanged before/after"):
@@ -71,13 +96,21 @@ from . import units
 from .backstops import BACKSTOP_SDK_METHODS, apply_backstops
 from .config import XArmDriverConfig
 from .driver import _default_api_factory
+from .rail import HOME_RAIL_SDK_WAIT_S  # shared with XArmDriver.home_rail (phase-09d)
 
 logger = logging.getLogger(__name__)
 
 ArmMonitorStatus = Literal["off", "connecting", "running", "stale", "paused", "error"]
 GripperKind = Literal["xarm", "xarm_g2", "none"]
-MaintenanceOp = Literal["clear_errors", "apply_backstops", "recover"]
-MAINTENANCE_OPS: tuple[str, ...] = ("clear_errors", "apply_backstops", "recover")
+MaintenanceOp = Literal["clear_errors", "apply_backstops", "recover", "home_rail"]
+MAINTENANCE_OPS: tuple[str, ...] = ("clear_errors", "apply_backstops", "recover", "home_rail")
+
+# Controller STATUS-ECHO codes: the raw ``UxbusState`` values a control box answers
+# with when something is latched — 1 ERR_CODE, 2 WAR_CODE, 9 STATE_NOT_READY. SDK
+# ``_check_code`` maps exactly these to 0 for every non-move call, so they are NOT
+# command failures. Only ``clean_error`` / ``clean_warn`` return them unmapped
+# (``x3/base.py:2394-2413``); see :meth:`ArmStateMonitor._judge`.
+STATUS_ECHO_CODES: frozenset[int] = frozenset({1, 2, 9})
 
 # ---------------------------------------------------------------------------
 # ZERO-WRITE ALLOWLIST — every XArmAPI member the POLLING may touch. Anything
@@ -108,11 +141,15 @@ READ_ONLY_SDK_ATTRS: frozenset[str] = frozenset(
     }
 )
 # Complete write set per maintenance operation (executed on the poll thread,
-# only on an explicit request). "recover" is refused by the monitor.
+# only on an explicit request). "recover" is refused by the monitor. "home_rail"
+# is the ONE op that moves something (the track carriage) — no motion_enable.
 MAINTENANCE_SDK_METHODS: Mapping[str, frozenset[str]] = {
     "clear_errors": frozenset({"clean_error", "clean_warn"}),
     "apply_backstops": frozenset(BACKSTOP_SDK_METHODS),
     "recover": frozenset(),
+    "home_rail": frozenset(
+        {"set_linear_track_back_origin", "set_linear_track_enable", "set_linear_track_speed"}
+    ),
 }
 
 MAX_RECONNECT_S = 10.0  # exponential backoff cap
@@ -126,6 +163,14 @@ STALE_THREAD_JOIN_S = 15.0
 BACKSTOP_READBACK_SETTLE_S = 0.5
 BACKSTOP_READBACK_POLL_S = 0.05
 TCP_LOAD_MATCH_KG = 0.05  # |read-back - config| tolerance (runtime uses the same)
+DEFAULT_MAINTENANCE_TIMEOUT_S = 10.0  # caller wait for clear_errors / apply_backstops
+# home_rail (phase-09c): the SDK waits up to HOME_RAIL_SDK_WAIT_S for on_zero, the
+# caller (and the REST handler) up to HOME_RAIL_TIMEOUT_S; stop()/disconnect() wait
+# that long for an in-flight homing before releasing the box. Duration is
+# unmeasured on the lab tracks ("~10 s" is folklore); 0.65 m at the track's own
+# homing speed fits comfortably. HOME_RAIL_SDK_WAIT_S (30 s) lives in rail.py.
+HOME_RAIL_TIMEOUT_S = 45.0
+HOME_RAIL_Q_TOL_RAD = 0.02  # max |q_now - expected_q| per joint before homing is refused
 
 
 def controller_error_title(code: int) -> str:
@@ -163,12 +208,17 @@ class ArmMonitorSample:
     rail_enabled: bool | None = None  # is_enabled == 1
     rail_pos_m: float | None = None  # None unless homed AND enabled
     rail_raw_mm: float | None = None  # raw register, always when present
+    rail_error: int | None = None  # track error register (0 = none); None when not present
     gripper_open_frac: float | None = None  # 0 closed .. 1 open; None for "none"
     gripper_raw: float | None = None  # raw SDK reading (G2 mm / classic pulses)
     # controller-side safety read-backs (phase-09b; slow rounds, rich report frame)
     collision_sensitivity: int | None = None  # 0..5; None until read
     tcp_load_kg: float | None = None  # set_tcp_load weight as the controller reports it
     tcp_load_cog_mm: tuple[float, ...] = ()  # (x, y, z) mm; () until read
+
+
+# (present, homed, enabled, pos_m, raw_mm, error) as read by _read_rail
+_RailRegs = tuple[bool | None, bool | None, bool | None, float | None, float | None, int | None]
 
 
 @dataclass(frozen=True)
@@ -187,13 +237,25 @@ class MaintenanceOutcome:
 
 
 class _MaintenanceRequest:
-    """One queued maintenance operation; completed by the poll thread."""
+    """One queued maintenance operation; completed by the poll thread.
 
-    __slots__ = ("op", "driver_cfg", "done", "outcome", "abandoned")
+    ``expected_q`` / ``q_tol_rad`` belong to ``home_rail``: the 7 joint angles the
+    runtime's rail sweep was checked at; the op refuses before its first write when
+    the before-sample deviates by more than ``q_tol_rad`` on any joint."""
 
-    def __init__(self, op: str, driver_cfg: XArmDriverConfig | None) -> None:
+    __slots__ = ("op", "driver_cfg", "expected_q", "q_tol_rad", "done", "outcome", "abandoned")
+
+    def __init__(
+        self,
+        op: str,
+        driver_cfg: XArmDriverConfig | None,
+        expected_q: tuple[float, ...] | None = None,
+        q_tol_rad: float = HOME_RAIL_Q_TOL_RAD,
+    ) -> None:
         self.op = op
         self.driver_cfg = driver_cfg
+        self.expected_q = expected_q
+        self.q_tol_rad = float(q_tol_rad)
         self.done = threading.Event()
         self.outcome: MaintenanceOutcome | None = None
         self.abandoned = False  # the caller timed out; nobody reads the outcome
@@ -229,8 +291,9 @@ class ArmStateMonitor:
     monitor is stopped / handed over; a request already executing re-checks the
     hand-over between its SDK calls and refuses BEFORE its first write, and
     ``stop()``/``disconnect()`` wait for an op that is mid-write (bounded by
-    ``STALE_THREAD_JOIN_S``) instead of disconnecting the client under it — so
-    no maintenance write ever races a session driver that just took the box.
+    ``STALE_THREAD_JOIN_S``; ``HOME_RAIL_TIMEOUT_S`` for ``home_rail``) instead
+    of disconnecting the client under it — so no maintenance write ever races a
+    session driver that just took the box and no homing is ever cut mid-travel.
     """
 
     def __init__(
@@ -278,6 +341,7 @@ class ArmStateMonitor:
         self._backoff_log: list[float] = []  # delays actually scheduled (tests)
         self._requests: deque[_MaintenanceRequest] = deque()  # serviced by the poll thread
         self._maintenance_active = False
+        self._active_op: str | None = None  # op executing on the poll thread (shutdown budget)
         self._stop_detail = ""  # why requests are refused after stop()/disconnect()
 
     # -- public surface ----------------------------------------------------------
@@ -346,18 +410,35 @@ class ArmStateMonitor:
         self,
         op: MaintenanceOp,
         driver_cfg: XArmDriverConfig | None = None,
-        timeout_s: float = 10.0,
+        timeout_s: float | None = None,
+        *,
+        expected_q: tuple[float, ...] | list[float] | None = None,
+        q_tol_rad: float = HOME_RAIL_Q_TOL_RAD,
     ) -> MaintenanceOutcome:
         """Run one explicit maintenance operation ON THE POLL THREAD and wait for it.
 
         ``clear_errors``: ``clean_error()`` + ``clean_warn()`` — nothing else, no
         enable (measured 2026-09-04: no motion). ``apply_backstops``:
         ``backstops.apply_backstops(api, driver_cfg)`` (``driver_cfg`` required).
+        ``home_rail`` (phase-09c, THE ONE MOTION OP — the carriage drives to the
+        zero end): needs ``driver_cfg`` (``rail_speed_mm_s``) and ``expected_q``
+        (the 7 joint angles the runtime's twin sweep was checked at); refused
+        before any write unless the before-sample shows the arm within
+        ``q_tol_rad`` of ``expected_q`` per joint, ``error_code == 0``, a track
+        present and no track error. Writes exactly
+        ``set_linear_track_back_origin(wait=True, timeout=HOME_RAIL_SDK_WAIT_S,
+        auto_enable=False)`` -> ``set_linear_track_enable(True)`` ->
+        ``set_linear_track_speed(cfg.rail_speed_mm_s)``; ``ok`` is judged from the
+        after-sample registers only (``on_zero == 1``, ``is_enabled == 1``,
+        ``error == 0``), never from the SDK return codes (module docstring).
         ``recover`` needs a session driver -> ``ok=False``. Not connected / paused
         / stopped -> ``ok=False``. The outcome carries the SDK return codes in
         call order, the sample right before and the sample right after (slow
-        fields — rail, gripper, sensitivity, payload — refreshed). On timeout the
-        request is abandoned (its late result is dropped) and ``ok=False``.
+        fields — rail, gripper, sensitivity, payload — refreshed). ``timeout_s``
+        defaults per op (``DEFAULT_MAINTENANCE_TIMEOUT_S``; ``HOME_RAIL_TIMEOUT_S``
+        for ``home_rail``); on timeout the request is abandoned (its late result
+        is dropped, the op itself still completes on the poll thread) and
+        ``ok=False``.
         """
         if op not in MAINTENANCE_OPS:
             raise ValueError(f"unknown maintenance op {op!r}; expected one of {MAINTENANCE_OPS}")
@@ -365,12 +446,28 @@ class ArmStateMonitor:
             return self._refuse(op, "recover needs a session")
         if op == "apply_backstops" and driver_cfg is None:
             return self._refuse(op, "apply_backstops needs the arm's driver config")
+        expected: tuple[float, ...] | None = None
+        if op == "home_rail":
+            if driver_cfg is None:
+                return self._refuse(op, "home_rail needs the arm's driver config (rail speed)")
+            if not self.expect_rail:
+                return self._refuse(op, "home_rail: this monitor does not poll a linear track")
+            if expected_q is None or len(expected_q) != 7:
+                return self._refuse(
+                    op,
+                    "home_rail needs expected_q: the 7 joint angles the rail sweep was checked at",
+                )
+            expected = tuple(float(v) for v in expected_q)
+            if q_tol_rad <= 0:
+                return self._refuse(op, "home_rail: q_tol_rad must be > 0")
+        if timeout_s is None:
+            timeout_s = HOME_RAIL_TIMEOUT_S if op == "home_rail" else DEFAULT_MAINTENANCE_TIMEOUT_S
         with self._lock:
             if not self._running or self._api is None:
                 status, detail = self._status, self._detail
                 req = None
             else:
-                req = _MaintenanceRequest(op, driver_cfg)
+                req = _MaintenanceRequest(op, driver_cfg, expected, q_tol_rad)
                 self._requests.append(req)
                 self._wake.set()  # do not wait out the current poll period
         if req is None:
@@ -541,21 +638,27 @@ class ArmStateMonitor:
         released = True
         if thread is not None and thread is not threading.current_thread():
             thread.join(timeout)
-            if thread.is_alive() and self._maintenance_in_flight():
+            active_op = self._maintenance_in_flight()
+            if thread.is_alive() and active_op is not None:
                 # An explicit maintenance op is executing on the poll thread. Never
                 # pull the client from under its writes: the op re-checks the
                 # hand-over between SDK calls (it refuses before its first write
                 # and skips the read-back after the last), so this wait is at most
-                # the SDK call in flight plus the writes already committed to.
+                # the SDK call in flight plus the writes already committed to. For
+                # home_rail that call is the SDK's homing wait (the carriage is
+                # moving): disconnecting would end the wait early with the track
+                # still travelling, so the budget is HOME_RAIL_TIMEOUT_S.
+                budget = HOME_RAIL_TIMEOUT_S if active_op == "home_rail" else STALE_THREAD_JOIN_S
                 logger.warning(
-                    "%s: maintenance op still executing %.1f s after %s; waiting for it "
+                    "%s: maintenance op %s still executing %.1f s after %s; waiting for it "
                     "(up to %.0f s) before releasing the box",
                     self.arm_id,
+                    active_op,
                     timeout,
                     detail,
-                    STALE_THREAD_JOIN_S,
+                    budget,
                 )
-                thread.join(max(0.0, STALE_THREAD_JOIN_S - timeout))
+                thread.join(max(0.0, budget - timeout))
             if thread.is_alive():
                 released = False
                 logger.warning(
@@ -573,9 +676,10 @@ class ArmStateMonitor:
         return released
 
     # -- maintenance channel (poll thread) -------------------------------------------
-    def _maintenance_in_flight(self) -> bool:
+    def _maintenance_in_flight(self) -> str | None:
+        """Name of the op executing on the poll thread, or None."""
         with self._lock:
-            return self._maintenance_active
+            return self._active_op if self._maintenance_active else None
 
     def _stopped_detail(self) -> str:
         """Refusal text once this generation may no longer publish."""
@@ -594,6 +698,7 @@ class ArmStateMonitor:
                     req.complete(self._refuse(req.op, detail))
                     continue
                 self._maintenance_active = True
+                self._active_op = req.op
                 return req
         return None
 
@@ -619,7 +724,10 @@ class ArmStateMonitor:
         codes: dict[str, int] = {}
         warnings: list[str] = []
         before: ArmMonitorSample | None = None
+        rail_regs: _RailRegs | None = None  # home_rail: register read-back right after the writes
         try:
+            with self._lock:  # home_rail: the before-sample must be NEWER than this
+                prev_seq = self._sample.seq if self._sample is not None else -1
             before = self._sample_now(gen, api)
             if not self._current(gen):  # stopped / handed over during the before-sample
                 req.complete(self._refuse(req.op, self._stopped_detail()))
@@ -632,11 +740,40 @@ class ArmStateMonitor:
                 warnings = apply_backstops(api, req.driver_cfg, codes)
                 if self._current(gen):  # a hand-over skips the read-back wait too
                     self._settle_backstops(api, req.driver_cfg)
+            elif req.op == "home_rail":
+                assert req.driver_cfg is not None  # checked in maintenance()
+                refusal = self._home_rail_refusal(req, before, prev_seq)
+                if refusal is not None:  # zero writes; the sample it was judged on rides along
+                    req.complete(
+                        MaintenanceOutcome(
+                            self.arm_id, req.op, ok=False, detail=refusal, before=before
+                        )
+                    )
+                    return
+                # THE motion write: the carriage drives to the zero end; the SDK
+                # blocks here until on_zero (or 30 s). Never auto_enable — its
+                # return code would mask the wait result (module docstring).
+                codes["set_linear_track_back_origin"] = int(
+                    api.set_linear_track_back_origin(
+                        wait=True, timeout=HOME_RAIL_SDK_WAIT_S, auto_enable=False
+                    )
+                )
+                # non-motion follow-ups, always issued once homing was started
+                codes["set_linear_track_enable"] = int(api.set_linear_track_enable(True))
+                codes["set_linear_track_speed"] = int(
+                    api.set_linear_track_speed(int(req.driver_cfg.rail_speed_mm_s))
+                )
+                # the judge needs the registers even when a hand-over landed meanwhile
+                # (the client is still ours: _shutdown waits for this op); one modbus read
+                rail_regs = self._read_rail(api, [])
             else:  # "recover" never reaches the queue; keep the refusal in one place
                 req.complete(self._refuse(req.op, "recover needs a session"))
                 return
             after = self._sample_now(gen, api) if self._current(gen) else None
-            ok, detail = self._judge(req, codes, warnings, before, after)
+            if req.op == "home_rail":
+                ok, detail = self._judge_home_rail(req, codes, before, rail_regs)
+            else:
+                ok, detail = self._judge(req, codes, warnings, before, after)
             if after is None:  # the writes ran; the hand-over pre-empted the read-back
                 detail += f" ({self._stopped_detail()} before the read-back)"
             req.complete(
@@ -667,6 +804,7 @@ class ArmStateMonitor:
         finally:
             with self._lock:
                 self._maintenance_active = False  # after complete(): busy covers the whole op
+                self._active_op = None
 
     def _sample_now(self, gen: int, api: Any) -> ArmMonitorSample | None:
         """One full (slow) poll; returns the newest published sample."""
@@ -689,6 +827,51 @@ class ArmStateMonitor:
                 return
             time.sleep(BACKSTOP_READBACK_POLL_S)
 
+    def _home_rail_refusal(
+        self, req: _MaintenanceRequest, before: ArmMonitorSample | None, prev_seq: int = -1
+    ) -> str | None:
+        """Why ``home_rail`` must NOT start (None = go). Evaluated on the before-sample,
+        before the first write: no FRESH sample (``_poll`` publishes nothing when
+        ``get_servo_angle`` fails, so ``before`` would silently be the previous
+        sample - equal to ``expected_q`` by construction - although the arm may have
+        moved; ``prev_seq`` is the newest seq before the re-sample), a sample older
+        than ``stale_s``, no track, controller error latched, track error latched, or
+        the arm no longer in the posture the twin sweep assumed."""
+        if before is None or before.seq <= prev_seq:
+            return (
+                "home_rail refused: could not take a fresh sample of the arm (get_servo_angle "
+                "failed) - the posture cannot be verified; retry"
+            )
+        age = self._clock() - before.t_mono
+        if age > self.stale_s:
+            return (
+                f"home_rail refused: the arm sample is {age:.1f} s old (stale after "
+                f"{self.stale_s:g} s) - the posture cannot be verified; retry"
+            )
+        if before.rail_present is not True:
+            return "home_rail refused: no linear track detected on this arm"
+        if before.error_code != 0:
+            return (
+                f"home_rail refused: {controller_error_title(before.error_code)} is latched; "
+                "clear errors first"
+            )
+        if before.rail_error:
+            return (
+                f"home_rail refused: linear track error {before.rail_error} is latched "
+                "(power-cycle the track / check it in UFACTORY Studio)"
+            )
+        if req.expected_q is None or len(before.q) != 7:
+            return "home_rail refused: no posture to compare against"
+        worst = max(range(7), key=lambda i: abs(before.q[i] - req.expected_q[i]))
+        dev = abs(before.q[worst] - req.expected_q[worst])
+        if dev > req.q_tol_rad:
+            return (
+                f"home_rail refused: the arm moved since the sweep was checked "
+                f"(joint {worst + 1} differs by {dev:.3f} rad, tolerance {req.q_tol_rad:g} rad); "
+                "re-run the check at the current posture"
+            )
+        return None
+
     def _judge(
         self,
         req: _MaintenanceRequest,
@@ -697,7 +880,21 @@ class ArmStateMonitor:
         before: ArmMonitorSample | None,
         after: ArmMonitorSample | None,
     ) -> tuple[bool, str]:
-        failed = [f"{name} returned {code}" for name, code in codes.items() if code != 0]
+        # SDK 1.18.5 returns clean_error() / clean_warn() RAW — they are the only
+        # writes here that skip ``_check_code`` (``x3/base.py:2394-2413``). A box with
+        # something latched answers with the STATUS ECHO, not a failure: ERR_CODE 1
+        # ("an error is/was latched"), WAR_CODE 2 ("a warning is/was latched"),
+        # STATE_NOT_READY 9 (stopped, brakes on) — precisely the three codes
+        # ``_check_code`` maps to 0 for every non-move call. Judging on the raw code
+        # made the operator's **Clear errors** click report "FAILED - clean_error
+        # returned 2" on 2026-09-05 while the controller error was in fact cleared
+        # (the after-sample read error_code 0). Like ``home_rail``, judge from the
+        # READ-BACK and keep the codes in ``sdk_codes`` for diagnosis.
+        failed = [
+            f"{name} returned {code}"
+            for name, code in codes.items()
+            if code != 0 and code not in STATUS_ECHO_CODES
+        ]
         if req.op == "clear_errors":
             err0 = before.error_code if before is not None else 0
             warn0 = before.warn_code if before is not None else 0
@@ -747,6 +944,50 @@ class ArmStateMonitor:
                 f" (read-back not yet reflected: sensitivity {after.collision_sensitivity}, "
                 f"payload {after.tcp_load_kg})"
             )
+        return True, detail
+
+    def _judge_home_rail(
+        self,
+        req: _MaintenanceRequest,
+        codes: dict[str, int],
+        before: ArmMonitorSample | None,
+        regs: _RailRegs | None,
+    ) -> tuple[bool, str]:
+        """REGISTERS ONLY: ok iff the read-back taken right after the writes says
+        ``on_zero == 1``, ``is_enabled == 1`` and track ``error == 0``. The SDK
+        return codes are reported for diagnosis (100 wait timeout, 101 register
+        reads failing, 80 track fault, 81 SCI low) but never decide — SDK 1.18.5
+        can return 0 for a homing that did not finish and nonzero for one that did."""
+        sdk_note = "; ".join(f"{name} returned {code}" for name, code in codes.items() if code != 0)
+        if regs is None:
+            return False, (
+                "homing writes were sent but the register read-back was skipped; "
+                "verify on_zero / is_enabled before using the track"
+                + (f" ({sdk_note})" if sdk_note else "")
+            )
+        present, homed, enabled, pos_m, raw_mm, track_err = regs
+        problems: list[str] = []
+        if present is not True:
+            problems.append("track registers unreadable after homing")
+        if homed is not True:
+            problems.append("on_zero still 0 (carriage did not reach the zero end)")
+        if enabled is not True:
+            problems.append("track not enabled")
+        if track_err:
+            problems.append(f"linear track error {track_err}")
+        if problems:
+            detail = "rail homing failed: " + ", ".join(problems)
+            return False, detail + (f" ({sdk_note})" if sdk_note else "")
+        assert req.driver_cfg is not None
+        pos = pos_m if pos_m is not None else 0.0
+        was_homed = before is not None and before.rail_homed is True
+        detail = (
+            f"rail {'re-' if was_homed else ''}homed: carriage at {pos:.3f} m (register "
+            f"{raw_mm if raw_mm is not None else 0:g} mm), track enabled, positioning speed "
+            f"{int(req.driver_cfg.rail_speed_mm_s)} mm/s"
+        )
+        if sdk_note:
+            detail += f" (registers are authoritative; {sdk_note})"
         return True, detail
 
     # -- one poll ----------------------------------------------------------------
@@ -799,6 +1040,7 @@ class ArmStateMonitor:
                 prev.rail_enabled,
                 prev.rail_pos_m,
                 prev.rail_raw_mm,
+                prev.rail_error,
             )
             grip = (prev.gripper_open_frac, prev.gripper_raw)
             sens, load_kg, load_cog = (
@@ -823,6 +1065,7 @@ class ArmStateMonitor:
             rail_enabled=rail[2],
             rail_pos_m=rail[3],
             rail_raw_mm=rail[4],
+            rail_error=rail[5],
             gripper_open_frac=grip[0],
             gripper_raw=grip[1],
             collision_sensitivity=sens,
@@ -841,17 +1084,15 @@ class ArmStateMonitor:
             self._sample = sample
             self._status, self._detail = "running", "; ".join(parts)
 
-    def _read_rail(
-        self, api: Any, problems: list[str]
-    ) -> tuple[bool | None, bool | None, bool | None, float | None, float | None]:
-        """(present, homed, enabled, pos_m, raw_mm); pos_m only when homed AND enabled."""
+    def _read_rail(self, api: Any, problems: list[str]) -> _RailRegs:
+        """(present, homed, enabled, pos_m, raw_mm, error); pos_m only when homed AND enabled."""
         if not self.expect_rail:
-            return (None, None, None, None, None)
+            return (None, None, None, None, None, None)
         code, regs = api.get_linear_track_registers()
         if code != 0:
-            return (False, None, None, None, None)  # 3 timeout / 20 host id / 23 length
+            return (False, None, None, None, None, None)  # 3 timeout / 20 host id / 23 length
         if not isinstance(regs, Mapping) or "pos" not in regs:
-            return (False, None, None, None, None)  # simulation-mode controller: (0, [])
+            return (False, None, None, None, None, None)  # simulation-mode controller: (0, [])
         homed = int(regs.get("on_zero", 0) or 0) == 1
         enabled = int(regs.get("is_enabled", 0) or 0) == 1
         raw_mm = float(regs.get("pos", 0) or 0)
@@ -859,7 +1100,7 @@ class ArmStateMonitor:
         if track_err:
             problems.append(f"linear track error {track_err}")
         pos_m = units.rail_mm_to_m(raw_mm) if (homed and enabled) else None
-        return (True, homed, enabled, pos_m, raw_mm)
+        return (True, homed, enabled, pos_m, raw_mm, track_err)
 
     def _read_gripper(
         self, api: Any, prev: ArmMonitorSample | None, problems: list[str]

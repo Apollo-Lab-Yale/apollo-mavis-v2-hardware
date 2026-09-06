@@ -4,7 +4,12 @@ Implements core's ArmInterface/CameraInterface/WorkcellInterface over the
 xArm-Python-SDK (pinned 1.18.5), plus NetworkManager auto-matching (netsetup),
 V4L2/RealSense camera backends and a read-only controller state monitor
 (``ArmStateMonitor``, phase-09a) with an explicit operator maintenance channel
-(``maintenance()``, phase-09b). Depends only on apollo-mavis-v2-core.
+(``maintenance()``, phase-09b; ``home_rail`` — the one motion op — phase-09c).
+The driver never homes the rail at connect (``RailNotHomedError`` by default,
+phase-09c); phase-09d adds ``XArmDriver.home_rail()`` for the runtime's
+operator-confirmed, twin-planned rail-homing maintenance motion on a driver
+connected with ``rail_homing: "allow_unhomed"``. Depends only on
+apollo-mavis-v2-core.
 """
 
 from . import units
@@ -25,6 +30,9 @@ from .events import (
 )
 from .grippers import ClassicGripper, G2Gripper, GripperBackend, NoGripper, make_gripper
 from .monitor import (
+    HOME_RAIL_Q_TOL_RAD,
+    HOME_RAIL_SDK_WAIT_S,
+    HOME_RAIL_TIMEOUT_S,
     MAINTENANCE_OPS,
     MAINTENANCE_SDK_METHODS,
     READ_ONLY_SDK_ATTRS,
@@ -37,7 +45,13 @@ from .monitor import (
     controller_error_title,
 )
 from .netsetup import ArmNet, NetSetup
-from .rail import RailController, RailPhase
+from .rail import (
+    UNKNOWN_RAIL_POS_M,
+    RailController,
+    RailHomeOutcome,
+    RailNotHomedError,
+    RailPhase,
+)
 from .workcell import ArmBringupStatus, HardwareWorkcell
 
 __version__ = "0.1.0"
@@ -74,6 +88,9 @@ __all__ = [
     "make_gripper",
     "RailController",
     "RailPhase",
+    "RailHomeOutcome",  # XArmDriver.home_rail() result (phase-09d)
+    "UNKNOWN_RAIL_POS_M",
+    "RailNotHomedError",  # core's class (re-exported for convenience)
     # read-only monitor (phase-09a) + maintenance channel (phase-09b)
     "ArmStateMonitor",
     "ArmMonitorSample",
@@ -82,6 +99,9 @@ __all__ = [
     "MaintenanceOutcome",
     "MAINTENANCE_OPS",
     "MAINTENANCE_SDK_METHODS",
+    "HOME_RAIL_TIMEOUT_S",
+    "HOME_RAIL_SDK_WAIT_S",
+    "HOME_RAIL_Q_TOL_RAD",
     "READ_ONLY_SDK_METHODS",
     "READ_ONLY_SDK_ATTRS",
     "controller_error_title",

@@ -13,14 +13,20 @@ from conftest import FakeClock
 from fakes.fake_xarm_api import FakeXArmAPI
 from test_driver_connect import wait_until
 
+from apollo_mavis_v2_hardware import monitor as monitor_mod
 from apollo_mavis_v2_hardware.backstops import apply_backstops, expected_backstop_sequence
 from apollo_mavis_v2_hardware.config import XArmDriverConfig
 from apollo_mavis_v2_hardware.monitor import (
+    HOME_RAIL_Q_TOL_RAD,
+    HOME_RAIL_SDK_WAIT_S,
+    HOME_RAIL_TIMEOUT_S,
     MAINTENANCE_OPS,
     MAINTENANCE_SDK_METHODS,
     MAX_RECONNECT_S,
     READ_ONLY_SDK_ATTRS,
     READ_ONLY_SDK_METHODS,
+    STALE_THREAD_JOIN_S,
+    STATUS_ECHO_CODES,
     ArmMonitorSample,
     ArmStateMonitor,
     MaintenanceOutcome,
@@ -291,6 +297,8 @@ def test_zero_writes_only_allowlisted_sdk_members_are_touched() -> None:
     assert {"collision_sensitivity", "tcp_load"} <= set(api.attrs)
     assert not (MAINTENANCE_SDK_METHODS["clear_errors"] & set(api.methods))
     assert not (MAINTENANCE_SDK_METHODS["apply_backstops"] & set(api.methods))
+    assert not (MAINTENANCE_SDK_METHODS["home_rail"] & set(api.methods))
+    assert raw.homing_started == 0  # the poller never homes
     assert mon.maintenance_busy is False
 
 
@@ -632,13 +640,44 @@ def test_maintenance_clear_errors_outcomes_without_error_and_when_it_relatches()
             "controller error 19: End Effector Communication Error re-latched right after clearing"
         )
         assert out.after is not None and out.after.error_code == 19
-        # a nonzero SDK return code
-        raw.clean_error = lambda: 1  # type: ignore[method-assign]
+        # a GENUINE SDK failure (transport, not a status echo) still fails the op
+        raw.error_code = 0
+        wait_sample(mon, lambda x: x.error_code == 0)
+        raw.clean_error = lambda: 3  # type: ignore[method-assign]  # ERR_TOUT
         out = mon.maintenance("clear_errors", timeout_s=3.0)
-        assert not out.ok and out.detail == "clean_error returned 1"
-        assert out.sdk_codes == {"clean_error": 1, "clean_warn": 0}
+        assert not out.ok and out.detail == "clean_error returned 3"
+        assert out.sdk_codes == {"clean_error": 3, "clean_warn": 0}
     finally:
         mon.stop()
+
+
+def test_clear_errors_status_echo_codes_are_not_failures() -> None:
+    """SDK 1.18.5 returns ``clean_error``/``clean_warn`` RAW (no ``_check_code``):
+    a box with something latched answers ERR_CODE 1 / WAR_CODE 2 / STATE_NOT_READY 9.
+    Those are status echoes, not failures — judging on them reported
+    "FAILED - clean_error returned 2" on the Perception Arm on 2026-09-05 while the
+    controller error HAD been cleared (the after-sample read error_code 0)."""
+    for echo in sorted(STATUS_ECHO_CODES):
+        mon, h = make_monitor({}, gripper="none", arm_id="view")
+        try:
+            mon.start()
+            wait_sample(mon)
+            raw = h["raw"]
+            raw.error_code = 19  # C19 latched, as found on the Perception Arm
+            wait_sample(mon, lambda x: x.error_code == 19)
+
+            def clean(raw=raw, echo=echo):  # clears the error AND echoes the status
+                raw.error_code = 0
+                return echo
+
+            raw.clean_error = clean  # type: ignore[method-assign]
+            out = mon.maintenance("clear_errors", timeout_s=3.0)
+            assert out.ok, f"echo {echo} judged a failure: {out.detail}"
+            assert out.detail.startswith("cleared controller error 19")
+            assert out.sdk_codes["clean_error"] == echo  # kept for diagnosis
+            assert out.after is not None and out.after.error_code == 0
+        finally:
+            mon.stop()
 
 
 def test_maintenance_apply_backstops_matches_backstops_py_sequence() -> None:
@@ -730,8 +769,8 @@ def test_maintenance_apply_backstops_tolerates_state_not_ready_when_read_back_ma
 def test_maintenance_refusals_never_touch_the_sdk() -> None:
     mon, h = make_monitor({}, gripper="none")
     with pytest.raises(ValueError):
-        mon.maintenance("home_rail")  # type: ignore[arg-type]
-    assert MAINTENANCE_OPS == ("clear_errors", "apply_backstops", "recover")
+        mon.maintenance("reboot")  # type: ignore[arg-type]
+    assert MAINTENANCE_OPS == ("clear_errors", "apply_backstops", "recover", "home_rail")
     # not started: off
     out = mon.maintenance("clear_errors", timeout_s=0.5)
     assert not out.ok and "monitor off" in out.detail and "raw" not in h
@@ -920,3 +959,416 @@ def test_maintenance_hand_over_mid_write_waits_for_the_op_and_reports_the_writes
     assert names.index("clean_warn") < names.index("disconnect")  # released AFTER the op
     assert mon.maintenance_busy is False
     assert mon.status == "paused" and raw.connected is False
+
+
+# -- home_rail: THE one motion op (phase-09c) ------------------------------------------
+
+
+HOME_Q = (0.1, -0.5, 0.2, 0.3, -0.1, 0.2, math.pi)
+
+
+def _rail_monitor(fake_kwargs=None, **kw):
+    base = {"has_rail": True, "rail_homed": False, "rail_enabled": False, "initial_q": list(HOME_Q)}
+    base.update(fake_kwargs or {})
+    return make_monitor(base, gripper="xarm_g2", **kw)
+
+
+def test_home_rail_constants_and_write_set() -> None:
+    assert HOME_RAIL_TIMEOUT_S == 45.0 and HOME_RAIL_SDK_WAIT_S == 30.0
+    assert HOME_RAIL_Q_TOL_RAD == 0.02
+    assert HOME_RAIL_TIMEOUT_S > HOME_RAIL_SDK_WAIT_S > 0
+    assert MAINTENANCE_SDK_METHODS["home_rail"] == {
+        "set_linear_track_back_origin",
+        "set_linear_track_enable",
+        "set_linear_track_speed",
+    }
+    assert "motion_enable" not in MAINTENANCE_SDK_METHODS["home_rail"]  # arm stays braked
+
+
+def test_home_rail_writes_exactly_the_three_track_calls_and_judges_from_registers() -> None:
+    """Happy path on the lab's power-on state (on_zero 0, is_enabled 0): exactly
+    back_origin(wait=True, timeout=30, auto_enable=False) -> enable(True) ->
+    speed(cfg) on the poll thread; nothing to the arm; ok from the after-sample."""
+    mon, h = _rail_monitor({"homing_duration_s": 0.15}, proxy=True)
+    cfg = _backstop_cfg(rail_speed_mm_s=50)
+    try:
+        mon.start()
+        s0 = wait_sample(mon, lambda x: x.rail_present is not None)
+        assert s0.rail_homed is False and s0.rail_enabled is False and s0.rail_error == 0
+        raw = h["raw"]
+        threads = record_threads(raw, "set_linear_track_back_origin", "set_linear_track_speed")
+        arm_before = (raw.state, raw.mode, raw.motion_enabled, raw.error_code)
+        t0 = time.monotonic()
+        out = mon.maintenance("home_rail", cfg, expected_q=s0.q)
+        assert time.monotonic() - t0 >= 0.15  # blocked for the homing travel
+        assert isinstance(out, MaintenanceOutcome) and out.ok, out.detail
+        assert out.op == "home_rail" and out.arm_id == "grip"
+        assert list(out.sdk_codes.items()) == [
+            ("set_linear_track_back_origin", 0),
+            ("set_linear_track_enable", 0),
+            ("set_linear_track_speed", 0),
+        ]
+        call = [c for c in raw.calls if c[0] == "set_linear_track_back_origin"][0]
+        assert call[2] == {"wait": True, "timeout": HOME_RAIL_SDK_WAIT_S, "auto_enable": False}
+        assert ("set_linear_track_enable", (True,), {}) in raw.calls
+        assert ("set_linear_track_speed", (50,), {}) in raw.calls
+        assert raw.homing_started == 1 and raw.homing_completed == 1
+        # judged from the after-sample REGISTERS
+        assert out.after is not None and out.before is not None
+        assert out.before.rail_homed is False
+        assert out.after.rail_homed is True and out.after.rail_enabled is True
+        assert out.after.rail_error == 0 and out.after.rail_pos_m == 0.0
+        assert out.after.seq > out.before.seq
+        assert out.detail == (
+            "rail homed: carriage at 0.000 m (register 0 mm), track enabled, "
+            "positioning speed 50 mm/s"
+        )
+        # on the poll thread, never the caller's; the ARM was not touched
+        assert set(threads.values()) == {"hw.grip.monitor-ro"}
+        assert (raw.state, raw.mode, raw.motion_enabled, raw.error_code) == arm_before
+        assert mon.maintenance_busy is False and mon.status == "running"
+        wait_sample(mon, lambda x: x.seq > out.after.seq and x.rail_pos_m == 0.0)
+    finally:
+        mon.stop()
+    api = h["api"]
+    mutating = [n for n in api.methods if n not in READ_ONLY_SDK_METHODS]
+    assert mutating == [
+        "set_linear_track_back_origin",
+        "set_linear_track_enable",
+        "set_linear_track_speed",
+    ]
+    assert set(mutating) == MAINTENANCE_SDK_METHODS["home_rail"]
+    assert set(api.attrs) <= READ_ONLY_SDK_ATTRS
+    assert not any(n in FORBIDDEN_NAMES - MAINTENANCE_SDK_METHODS["home_rail"] for n in api.methods)
+    assert "motion_enable" not in api.methods and "set_state" not in api.methods
+
+
+def test_home_rail_refused_on_posture_mismatch_before_any_write() -> None:
+    mon, h = _rail_monitor()
+    cfg = _backstop_cfg()
+    try:
+        mon.start()
+        s0 = wait_sample(mon, lambda x: x.rail_present is not None)
+        moved = list(s0.q)
+        moved[3] += 0.05  # > 0.02 rad: the sweep was checked at a different posture
+        out = mon.maintenance("home_rail", cfg, expected_q=moved)
+        assert not out.ok
+        assert out.detail.startswith("home_rail refused: the arm moved since the sweep was checked")
+        assert "joint 4" in out.detail and "0.050 rad" in out.detail and "0.02 rad" in out.detail
+        assert out.sdk_codes == {} and out.after is None
+        raw = h["raw"]
+        assert raw.homing_started == 0 and raw.rail_homed is False and raw.rail_enabled is False
+        assert [n for n in raw.call_names() if n.startswith("set_")] == []
+        # within tolerance -> accepted (and a wider caller tolerance is honoured)
+        near = list(s0.q)
+        near[3] += 0.019
+        out = mon.maintenance("home_rail", cfg, expected_q=near)
+        assert out.ok, out.detail
+        assert raw.homing_started == 1
+        out = mon.maintenance("home_rail", cfg, expected_q=moved, q_tol_rad=0.1)
+        assert out.ok and raw.homing_started == 2  # re-homing an already homed track is allowed
+        assert out.detail.startswith("rail re-homed")
+    finally:
+        mon.stop()
+
+
+def test_home_rail_refused_when_no_fresh_sample_could_be_taken() -> None:
+    """The posture re-check must run on a FRESH read. `_poll` publishes nothing when
+    get_servo_angle fails, so `before` would silently be the PREVIOUS sample (equal to
+    expected_q by construction) although the arm moved -> refuse, zero writes."""
+    mon, h = _rail_monitor()
+    cfg = _backstop_cfg()
+    try:
+        mon.start()
+        s0 = wait_sample(mon, lambda x: x.rail_present is not None)
+        raw = h["raw"]
+        raw._q = [v + 0.5 for v in raw._q]  # the arm moved on every joint ...
+        raw.get_servo_angle = lambda *a, **k: (1, [])  # ... and the joint read now fails
+        wait_until(lambda: "get_servo_angle returned code 1" in mon.detail)
+        seq_before = mon.snapshot().seq
+        out = mon.maintenance("home_rail", cfg, expected_q=s0.q)
+        assert not out.ok
+        assert out.detail.startswith("home_rail refused: could not take a fresh sample")
+        assert "get_servo_angle failed" in out.detail
+        assert out.sdk_codes == {} and out.after is None
+        assert out.before is not None and out.before.seq == seq_before  # no fresh read
+        assert raw.homing_started == 0 and raw.rail_homed is False and raw.rail_enabled is False
+        assert [n for n in raw.call_names() if n.startswith("set_")] == []
+    finally:
+        mon.stop()
+
+
+def test_home_rail_refused_when_a_controller_or_track_error_is_latched() -> None:
+    mon, h = _rail_monitor()
+    cfg = _backstop_cfg()
+    try:
+        mon.start()
+        s0 = wait_sample(mon, lambda x: x.rail_present is not None)
+        raw = h["raw"]
+        raw.error_code = 19  # the Perception Arm's live C19
+        wait_sample(mon, lambda x: x.error_code == 19)
+        out = mon.maintenance("home_rail", cfg, expected_q=s0.q)
+        assert not out.ok
+        assert out.detail == (
+            "home_rail refused: controller error 19: End Effector Communication Error "
+            "is latched; clear errors first"
+        )
+        raw.error_code = 0
+        raw.inject_track_error(25)  # e.g. over-travel latched on the track itself
+        s1 = wait_sample(mon, lambda x: x.error_code == 0 and x.rail_error == 25)
+        assert "linear track error 25" in mon.detail
+        out = mon.maintenance("home_rail", cfg, expected_q=s1.q)
+        assert not out.ok and out.detail.startswith("home_rail refused: linear track error 25")
+        assert raw.homing_started == 0
+        assert [n for n in raw.call_names() if n.startswith("set_")] == []
+    finally:
+        mon.stop()
+
+
+def test_home_rail_refusals_without_config_posture_or_track_never_queue() -> None:
+    mon, h = _rail_monitor()
+    try:
+        mon.start()
+        s0 = wait_sample(mon, lambda x: x.rail_present is not None)
+        out = mon.maintenance("home_rail", None, expected_q=s0.q)
+        assert not out.ok and "driver config" in out.detail
+        out = mon.maintenance("home_rail", _backstop_cfg())
+        assert not out.ok and "expected_q" in out.detail
+        out = mon.maintenance("home_rail", _backstop_cfg(), expected_q=(0.0,) * 6)
+        assert not out.ok and "expected_q" in out.detail
+        out = mon.maintenance("home_rail", _backstop_cfg(), expected_q=s0.q, q_tol_rad=0.0)
+        assert not out.ok and "q_tol_rad" in out.detail
+        assert mon.maintenance_busy is False
+        assert [n for n in h["raw"].call_names() if n.startswith("set_")] == []
+    finally:
+        mon.stop()
+    # a monitor that does not poll a rail refuses too
+    mon2, h2 = make_monitor({"has_rail": True}, expect_rail=False)
+    try:
+        mon2.start()
+        s = wait_sample(mon2)
+        out = mon2.maintenance("home_rail", _backstop_cfg(), expected_q=s.q)
+        assert not out.ok and "does not poll a linear track" in out.detail
+    finally:
+        mon2.stop()
+    # no track on the bus: refused from the before-sample, nothing written
+    mon3, h3 = make_monitor({"has_rail": False, "initial_q": list(HOME_Q)})
+    try:
+        mon3.start()
+        s = wait_sample(mon3, lambda x: x.rail_present is not None)
+        out = mon3.maintenance("home_rail", _backstop_cfg(), expected_q=s.q)
+        assert (
+            not out.ok and out.detail == "home_rail refused: no linear track detected on this arm"
+        )
+        assert [n for n in h3["raw"].call_names() if n.startswith("set_")] == []
+    finally:
+        mon3.stop()
+
+
+def test_home_rail_judges_only_the_registers_never_the_sdk_return_code(monkeypatch) -> None:
+    """SDK 1.18.5 can return nonzero for a homing that finished (101 = register
+    reads flaky) and 0 for one that did not (auto_enable masking); the monitor
+    passes auto_enable=False and decides from on_zero / is_enabled / error."""
+    monkeypatch.setattr(monitor_mod, "HOME_RAIL_SDK_WAIT_S", 0.2)  # keep the timeout case fast
+    cfg = _backstop_cfg()
+    # (a) code 101 but the carriage reached zero -> ok, code reported for diagnosis
+    mon, h = _rail_monitor({"homing_result_code": 101})
+    try:
+        mon.start()
+        s0 = wait_sample(mon, lambda x: x.rail_present is not None)
+        out = mon.maintenance("home_rail", cfg, expected_q=s0.q)
+        assert out.ok, out.detail
+        assert out.sdk_codes["set_linear_track_back_origin"] == 101
+        assert out.detail.endswith(
+            "(registers are authoritative; set_linear_track_back_origin returned 101)"
+        )
+        assert out.after is not None and out.after.rail_homed and out.after.rail_enabled
+    finally:
+        mon.stop()
+    # (b) code 0 (the SDK lies) but on_zero still 0: the carriage never got there -> not ok
+    mon, h = _rail_monitor({"homing_result_code": 0, "homing_duration_s": 10.0})
+    try:
+        mon.start()
+        s0 = wait_sample(mon, lambda x: x.rail_present is not None)
+        t0 = time.monotonic()
+        out = mon.maintenance("home_rail", cfg, expected_q=s0.q)
+        assert 0.2 <= time.monotonic() - t0 < 2.0  # waited the (patched) SDK timeout, no more
+        call = [c for c in h["raw"].calls if c[0] == "set_linear_track_back_origin"][0]
+        assert call[2]["timeout"] == 0.2 and call[2]["auto_enable"] is False
+        assert not out.ok
+        assert out.sdk_codes == {
+            "set_linear_track_back_origin": 0,
+            "set_linear_track_enable": 0,
+            "set_linear_track_speed": 0,
+        }
+        assert (
+            out.detail
+            == "rail homing failed: on_zero still 0 (carriage did not reach the zero end)"
+        )
+        assert out.after is not None and out.after.rail_homed is False
+        assert out.after.rail_enabled is True  # the follow-up writes still went out (non-motion)
+    finally:
+        mon.stop()
+    # (c) an honest timeout (100) reads the same from the registers; the code is a hint only
+    mon, h = _rail_monitor({"homing_duration_s": 10.0})
+    try:
+        mon.start()
+        s0 = wait_sample(mon, lambda x: x.rail_present is not None)
+        out = mon.maintenance("home_rail", cfg, expected_q=s0.q)
+        assert not out.ok and out.sdk_codes["set_linear_track_back_origin"] == 100
+        assert out.detail == (
+            "rail homing failed: on_zero still 0 (carriage did not reach the zero end) "
+            "(set_linear_track_back_origin returned 100)"
+        )
+    finally:
+        mon.stop()
+    # (d) a track error during the travel: registers say error 26 (and the enable
+    #     could not take) -> not ok, both problems named
+    mon, h = _rail_monitor({"homing_duration_s": 10.0})
+    try:
+        mon.start()
+        s0 = wait_sample(mon, lambda x: x.rail_present is not None)
+        raw = h["raw"]
+        threading.Timer(0.05, raw.inject_track_error, args=(26,)).start()
+        out = mon.maintenance("home_rail", cfg, expected_q=s0.q)
+        assert not out.ok
+        assert out.sdk_codes["set_linear_track_back_origin"] == 80
+        assert out.sdk_codes["set_linear_track_enable"] == 80
+        assert "linear track error 26" in out.detail and "track not enabled" in out.detail
+        assert out.after is not None and out.after.rail_error == 26
+    finally:
+        mon.stop()
+
+
+def test_fake_back_origin_mirrors_the_sdk_auto_enable_masking() -> None:
+    """Pins the SDK 1.18.5 behaviour the monitor works around: with the default
+    auto_enable=True the enable's return code overwrites the wait result, so a
+    homing that timed out comes back as 0; with auto_enable=False the truth (100)
+    survives. Registers tell the real story either way."""
+    api = FakeXArmAPI(has_rail=True, rail_homed=False, homing_duration_s=10.0)
+    t0 = time.monotonic()
+    assert api.set_linear_track_back_origin(wait=True, timeout=0.05) == 0  # masked!
+    assert time.monotonic() - t0 < 1.0
+    assert api.rail_homed is False and api.rail_enabled is True  # enabled but NOT homed
+    api.rail_enabled = False
+    assert api.set_linear_track_back_origin(wait=True, timeout=0.05, auto_enable=False) == 100
+    assert api.rail_homed is False and api.rail_enabled is False
+    # link loss during the wait ends it with 100 too (the SDK loop checks .connected)
+    threading.Timer(0.05, api.disconnect).start()
+    assert api.set_linear_track_back_origin(wait=True, timeout=5.0, auto_enable=False) == 100
+    assert api.rail_homed is False
+    # a fast track: the wait result is 0 and the registers agree
+    api2 = FakeXArmAPI(has_rail=True, rail_homed=False, homing_duration_s=0.02)
+    assert api2.set_linear_track_back_origin(wait=True, timeout=1.0, auto_enable=False) == 0
+    assert api2.rail_homed is True and api2.rail_enabled is False and api2.homing_completed == 1
+    # a track error aborts with 80 and the enable does not take
+    api3 = FakeXArmAPI(has_rail=True, rail_homed=False)
+    api3.inject_track_error(25)
+    assert api3.set_linear_track_back_origin(wait=True, timeout=1.0) == 80
+    assert api3.rail_homed is False and api3.rail_enabled is False
+    assert api3.set_linear_track_enable(True) == 80
+    api3.clean_linear_track_error()
+    assert api3.set_linear_track_enable(True) == 0 and api3.rail_enabled is True
+
+
+def test_home_rail_hand_over_waits_for_the_homing_to_finish() -> None:
+    """disconnect() lands while the carriage is travelling: the monitor must NOT
+    pull the SDK client (the SDK wait loop would end early with the track still
+    moving); it waits for the op, releases afterwards, and the outcome is ok."""
+    mon, h = _rail_monitor({"homing_duration_s": 0.6})
+    cfg = _backstop_cfg()
+    mon.start()
+    s0 = wait_sample(mon, lambda x: x.rail_present is not None)
+    raw = h["raw"]
+    result: dict = {}
+    t = threading.Thread(
+        target=lambda: result.update(out=mon.maintenance("home_rail", cfg, expected_q=s0.q))
+    )
+    t.start()
+    wait_until(lambda: raw.homing_started == 1, msg="homing never started")
+    assert mon.maintenance_busy is True
+    t0 = time.monotonic()
+    assert mon.disconnect(timeout=0.05) is True  # waited for the op, then released
+    assert time.monotonic() - t0 >= 0.4
+    t.join(3.0)
+    out = result["out"]
+    assert out.ok, out.detail
+    assert out.after is None  # the hand-over pre-empted the read-back...
+    assert "monitor paused: released for hand-over before the read-back" in out.detail
+    assert list(out.sdk_codes) == [
+        "set_linear_track_back_origin",
+        "set_linear_track_enable",
+        "set_linear_track_speed",
+    ]
+    names = raw.call_names()
+    assert names.index("set_linear_track_speed") < names.index("disconnect")  # released AFTER
+    assert raw.rail_homed is True and raw.homing_completed == 1  # ...but the homing finished
+    assert raw.rail_enabled is True and raw.connected is False
+    assert mon.status == "paused" and mon.maintenance_busy is False
+
+
+def test_home_rail_hand_over_budget_is_45_s_not_the_generic_15_s(monkeypatch) -> None:
+    """The generic mid-write wait is STALE_THREAD_JOIN_S; a homing in flight gets
+    HOME_RAIL_TIMEOUT_S. Scaled down: generic 0.1 s, home_rail 1.0 s, homing 0.5 s."""
+    monkeypatch.setattr(monitor_mod, "STALE_THREAD_JOIN_S", 0.1)
+    monkeypatch.setattr(monitor_mod, "HOME_RAIL_TIMEOUT_S", 1.0)
+    assert STALE_THREAD_JOIN_S == 15.0  # the real constants
+    mon, h = _rail_monitor({"homing_duration_s": 0.5})
+    mon.start()
+    s0 = wait_sample(mon, lambda x: x.rail_present is not None)
+    raw = h["raw"]
+    result: dict = {}
+    t = threading.Thread(
+        target=lambda: result.update(
+            out=mon.maintenance("home_rail", _backstop_cfg(), expected_q=s0.q, timeout_s=3.0)
+        )
+    )
+    t.start()
+    wait_until(lambda: raw.homing_started == 1, msg="homing never started")
+    assert mon.stop(timeout=0.02) is True  # 0.5 s > the generic 0.1 s budget, < 1.0 s
+    t.join(3.0)
+    assert result["out"].ok and raw.rail_homed is True
+    assert raw.call_names().index("set_linear_track_speed") < raw.call_names().index("disconnect")
+
+
+def test_home_rail_status_is_stale_and_busy_while_homing() -> None:
+    """Documented: the poll thread sits in the SDK wait, no sample is published,
+    so the arm reads 'stale' + maintenance_busy until the op completes."""
+    mon, h = _rail_monitor({"homing_duration_s": 0.5}, stale_s=0.1)
+    cfg = _backstop_cfg()
+    try:
+        mon.start()
+        s0 = wait_sample(mon, lambda x: x.rail_present is not None)
+        raw = h["raw"]
+        result: dict = {}
+        t = threading.Thread(
+            target=lambda: result.update(out=mon.maintenance("home_rail", cfg, expected_q=s0.q))
+        )
+        t.start()
+        wait_until(lambda: raw.homing_started == 1, msg="homing never started")
+        wait_until(lambda: mon.status == "stale", timeout=1.0, msg=f"status {mon.status}")
+        assert mon.maintenance_busy is True
+        assert mon.snapshot().rail_homed is False  # last sample predates the homing
+        t.join(3.0)
+        assert result["out"].ok
+        wait_until(lambda: mon.status == "running")
+        assert mon.maintenance_busy is False
+        wait_sample(mon, lambda x: x.rail_homed is True and x.rail_pos_m == 0.0)
+    finally:
+        mon.stop()
+
+
+def test_home_rail_caller_timeout_abandons_but_the_homing_still_completes() -> None:
+    mon, h = _rail_monitor({"homing_duration_s": 0.3})
+    try:
+        mon.start()
+        s0 = wait_sample(mon, lambda x: x.rail_present is not None)
+        out = mon.maintenance("home_rail", _backstop_cfg(), expected_q=s0.q, timeout_s=0.05)
+        assert not out.ok and "home_rail timed out after 0.05 s" in out.detail
+        assert mon.maintenance_busy is True  # the op is still running on the poll thread
+        wait_until(lambda: not mon.maintenance_busy, timeout=3.0)
+        raw = h["raw"]
+        assert raw.rail_homed is True and raw.rail_enabled is True and raw.homing_completed == 1
+        wait_sample(mon, lambda x: x.rail_homed is True)
+    finally:
+        mon.stop()

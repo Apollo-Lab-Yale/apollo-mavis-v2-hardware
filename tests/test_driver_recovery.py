@@ -312,3 +312,152 @@ def test_auto_recovery_records_its_result_too() -> None:
         assert res is not None and res.ok and res.error_code == 24 and not res.user_initiated
     finally:
         drv.disconnect()
+
+
+# -- servo-mode readiness: state 2 is HEALTHY, not an external grab -------------------
+# Regression pack for the 2026-09-05 lab session, where the first hardware teleop
+# session latched BOTH arms with "external mode/state conflict persisted (UFACTORY
+# Studio?)" while no Studio was running: a held mode-1 arm reports controller state 2
+# (standby) and the detector accepted only {0, 1}. The Perception Arm's first fault
+# came from the other half of the same misunderstanding — the very first servo tick
+# after set_state(0) returned APIState 9 because the box was still entering servo mode.
+
+
+def test_standby_state_2_is_not_an_external_conflict() -> None:
+    """A healthy held arm sits in mode 1 / state 2 and must stay STREAMING."""
+    drv, h = make_driver()
+    api = h["api"]
+    try:
+        wait_until(lambda: len(api.sent_joints) > 3, msg="stream never started")
+        assert api.mode == 1 and api.state == 2  # what both lab boxes report
+        drv.drain_events()
+        time.sleep(0.8)  # well past the 0.5 s set_mode grace of the detector
+        events = drv.drain_events()
+        assert not any(isinstance(e, StudioConflictWarning) for e in events), events
+        assert not any(isinstance(e, FaultEvent) for e in events), events
+        assert drv.phase is DriverPhase.STREAMING
+        n = len(api.sent_joints)
+        time.sleep(0.1)
+        assert len(api.sent_joints) > n  # still streaming
+    finally:
+        drv.disconnect()
+
+
+def test_external_stop_state_4_is_still_detected() -> None:
+    """The detector must keep catching a real grab: someone stopped the arm
+    (state 4) with no controller error, mode untouched."""
+    drv, h = make_driver()
+    api = h["api"]
+    try:
+        wait_until(lambda: len(api.sent_joints) > 3)
+        time.sleep(0.6)  # past the set_mode grace window
+        api.state = 4  # external stop; no error code, mode still 1
+        api.ready_to_move = False
+        events = collect_until(
+            drv, lambda evs: any(isinstance(e, StudioConflictWarning) for e in evs)
+        )
+        warn = next(e for e in events if isinstance(e, StudioConflictWarning))
+        assert warn.state == 4 and warn.mode == 1
+    finally:
+        drv.disconnect()
+
+
+def test_persistent_external_stop_latches_without_blaming_studio() -> None:
+    """Twice within 5 s -> LATCHED, and the reason states what was MEASURED
+    (who holds Studio's port 18333 is invisible to the host)."""
+    drv, h = make_driver()
+    api = h["api"]
+    try:
+        wait_until(lambda: len(api.sent_joints) > 3)
+        time.sleep(0.6)
+        api.state = 3  # paused by an external actor
+        api.ready_to_move = False
+        collect_until(drv, lambda evs: any(isinstance(e, StudioConflictWarning) for e in evs))
+        wait_until(lambda: drv.phase is DriverPhase.STREAMING, msg="never retried mode 1")
+        api.state = 3  # again, inside the 5 s window
+        api.ready_to_move = False
+        wait_until(
+            lambda: drv.phase is DriverPhase.LATCHED, timeout=5.0, msg="never latched"
+        )
+        with pytest.raises(ArmFaultedError) as exc:
+            drv.command_joints(np.zeros(7))
+        detail = str(exc.value)
+        assert "left servo mode" in detail and "state 3" in detail
+        assert "UFACTORY Studio?" not in detail  # no unverifiable accusation
+    finally:
+        drv.disconnect()
+
+
+def test_servo_not_ready_race_at_mode_entry_does_not_fault() -> None:
+    """The box needs a moment after set_state(0): a handful of APIState 9 returns
+    inside the post-resume grace window are retried, not faulted."""
+    drv, h = make_driver(fake_kwargs={"fault_script": FaultScript(not_ready_ticks=3)})
+    api = h["api"]
+    try:
+        wait_until(lambda: len(api.sent_joints) > 3, msg="stream never recovered from the race")
+        events = drv.drain_events()
+        assert not any(isinstance(e, FaultEvent) for e in events), events
+        assert drv.phase is DriverPhase.STREAMING
+        assert drv.tick_stats.faults == 0
+    finally:
+        drv.disconnect()
+
+
+def test_connect_waits_for_a_healthy_servo_state_before_streaming() -> None:
+    """``get_state()`` is polled after set_state(0) so the first servo tick is not
+    the thing that discovers the controller was not ready yet."""
+    drv, h = make_driver()
+    api = h["api"]
+    try:
+        names = [n for n, _a, _kw in api.calls]
+        assert "get_state" in names, names
+        i_state = max(i for i, n in enumerate(names) if n == "set_state")
+        assert names.index("get_state", i_state) > i_state
+    finally:
+        drv.disconnect()
+
+
+def test_not_ready_beyond_the_grace_window_still_faults() -> None:
+    """The grace window is bounded: a controller that stays not-ready faults."""
+    drv, h = make_driver()
+    api = h["api"]
+    try:
+        wait_until(lambda: len(api.sent_joints) > 3)
+        drv.drain_events()
+        api.ready_to_move = False  # persistent STATE_NOT_READY, no error code
+        events = collect_until(
+            drv,
+            lambda evs: any(
+                isinstance(e, FaultEvent) and e.source == "servo" for e in evs
+            ),
+            timeout=3.0,
+        )
+        fault = next(e for e in events if isinstance(e, FaultEvent) and e.source == "servo")
+        assert fault.code == 9
+    finally:
+        drv.disconnect()
+
+
+def test_not_ready_grace_is_bounded_by_tick_count_too() -> None:
+    """The grace window is bounded BOTH ways (wall time AND ticks), so a stalled
+    clock cannot turn it into "swallow APIState 9 forever"."""
+    drv, h = make_driver()
+    api = h["api"]
+    try:
+        wait_until(lambda: len(api.sent_joints) > 3)
+        streamer = drv._streamer
+        assert streamer is not None
+        assert streamer._grace_ticks_max == int(
+            0.3 * drv.cfg.servo.rate_hz
+        )  # 30 ticks at 100 Hz
+        drv.drain_events()
+        api.ready_to_move = False  # persistent not-ready
+        collect_until(
+            drv,
+            lambda evs: any(isinstance(e, FaultEvent) and e.source == "servo" for e in evs),
+            timeout=3.0,
+        )
+        # at most one grace window's worth of ticks was ever swallowed
+        assert streamer.not_ready_ticks <= streamer._grace_ticks_max
+    finally:
+        drv.disconnect()

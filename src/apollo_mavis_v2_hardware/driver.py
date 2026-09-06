@@ -21,6 +21,7 @@ from apollo_mavis_v2_core import (
     ArmIdentityError,
     ArmInterface,
     ArmState,
+    BringupError,
     CommandError,
     GripperCommand,
     GripperState,
@@ -44,7 +45,7 @@ from .events import (
     TickStats,
 )
 from .grippers import GripperBackend, make_gripper, read_fw_tuple
-from .rail import RailController
+from .rail import RailController, RailHomeOutcome
 
 IS_REAL_READBACK_FW = (1, 9, 110)  # get_servo_angle(is_real=True) gate
 
@@ -78,6 +79,39 @@ RECOVERY_BUDGET = 3  # recoveries per rolling window, else LATCHED
 RECOVERY_WINDOW_S = 30.0
 C24_BACKOFF_S = 10.0  # halved vel/acc after a C24 recovery
 C24_ERROR = 24
+
+# Controller STATE codes (SDK ``XArmAPI.state``): 0 ready, 1 in motion, 2 standby
+# ("sleeping"), 3 paused, 4 stopped, 5 stopped/collision-halt, 6 decelerating to a
+# stop. The SDK's own readiness rule is ``ready = state not in (4, 5)``
+# (``x3/base.py`` ``__handle_report_real`` and the normal/rich handlers all do
+# ``if state in [4, 5]: self._is_ready = False else: ... = True``).
+#
+# **A healthy mode-1 arm that is not executing a servo step reports state 2.**
+# Both lab boxes sit in ``mode 1 state 2`` for the whole session (2026-09-05) —
+# the servo stream re-sends the held posture, which is not "motion". Treating
+# anything outside {0, 1} as an external grab therefore fired the Studio-conflict
+# detector ~0.5 s after every connect and every recovery and latched BOTH arms
+# with "external mode/state conflict persisted" while no Studio was running.
+SERVO_HEALTHY_STATES = frozenset({0, 1, 2})
+# States that mean somebody else stopped/paused the arm under us (no error code):
+# 3 paused, 4/5 stopped, 6 decelerating. Undocumented codes are NOT treated as a
+# conflict — a detector that fires on an unrecognised state is what caused the
+# 2026-09-05 false-positive latch; real trouble also surfaces as an error code or
+# as a non-zero ``set_servo_angle_j`` return.
+SERVO_CONFLICT_STATES = frozenset({3, 4, 5, 6})
+
+STATE_NOT_READY_CODE = 9  # xarm ``APIState``/``UxbusState.STATE_NOT_READY``
+# Entering servo mode is not instantaneous: after ``set_mode(1); set_state(0)`` the
+# control box needs tens of ms before ``move_servoj`` is accepted (its TCP replies
+# carry "not ready", bit 0x10 -> the SDK maps the move to APIState 9). A blind
+# ``sleep(0.1)`` raced it on the real boxes (2026-09-05: the FIRST servo tick of the
+# very first hardware session returned 9 and faulted the Perception Arm during
+# bring-up), so the driver polls for a healthy state instead, and the streamer
+# tolerates code 9 for a bounded grace right after it resumes.
+SERVO_READY_TIMEOUT_S = 1.5
+SERVO_READY_POLL_S = 0.02
+SERVO_READY_MAX_POLLS = int(SERVO_READY_TIMEOUT_S / SERVO_READY_POLL_S) + 2
+SERVO_NOT_READY_GRACE_S = 0.3
 
 
 def classify_error(err: int) -> FaultKind:
@@ -162,6 +196,14 @@ class _ServoStreamer:
         self._ticks = 0
         self._late_ticks = 0
         self._faults = 0
+        # bounded STATE_NOT_READY tolerance right after resume() (see
+        # SERVO_NOT_READY_GRACE_S): the control box may still be entering servo mode.
+        # Bounded BOTH ways — wall time and tick count — so a stalled or frozen clock
+        # cannot turn the window into "swallow code 9 forever".
+        self._grace_until = 0.0
+        self._grace_ticks = 0
+        self._grace_ticks_max = max(1, int(SERVO_NOT_READY_GRACE_S * limits.rate_hz))
+        self._not_ready_ticks = 0
 
     # -- control ------------------------------------------------------------
     def set_target(self, q7: np.ndarray) -> None:
@@ -184,6 +226,9 @@ class _ServoStreamer:
     def resume(self) -> None:
         with self._lock:
             self._paused = False
+            # the box may still be entering servo mode: tolerate APIState 9 briefly
+            self._grace_until = self._clock() + SERVO_NOT_READY_GRACE_S
+            self._grace_ticks = self._grace_ticks_max
 
     def set_scale(self, scale: float) -> None:
         with self._lock:
@@ -210,6 +255,12 @@ class _ServoStreamer:
     @property
     def paused(self) -> bool:
         return self._paused
+
+    @property
+    def not_ready_ticks(self) -> int:
+        """Servo ticks swallowed as STATE_NOT_READY inside the post-resume grace
+        window (diagnostics; a non-zero count is normal right after mode entry)."""
+        return self._not_ready_ticks
 
     @property
     def stats(self) -> TickStats:
@@ -247,6 +298,7 @@ class _ServoStreamer:
                 last_sent = self._last_sent
                 prev_dq = self._prev_dq
                 scale = self._scale
+                in_grace = now < self._grace_until and self._grace_ticks > 0
             dq = np.clip(target - last_sent, -self._vel_step * scale, self._vel_step * scale)
             dq = np.clip(dq, prev_dq - self._acc_step * scale, prev_dq + self._acc_step * scale)
             cart_est = float(np.sum(np.abs(dq) * self._lever))  # conservative TCP bound
@@ -262,6 +314,13 @@ class _ServoStreamer:
                 with self._lock:
                     self._last_sent = q_cmd
                     self._prev_dq = q_cmd - last_sent
+            elif int(code) == STATE_NOT_READY_CODE and in_grace:
+                # the box has not finished entering servo mode: retry next tick,
+                # do NOT advance _last_sent (nothing moved) and do NOT fault yet.
+                # Past the grace window a 9 faults like any other bad return.
+                self._not_ready_ticks += 1
+                with self._lock:
+                    self._grace_ticks -= 1
             else:
                 self._faults += 1
                 self.pause()  # §3.5 takes over on the monitor thread
@@ -376,6 +435,16 @@ class XArmDriver(ArmInterface):
         return self._rail.phase.name if self._rail is not None else None
 
     @property
+    def rail_position_known(self) -> bool:
+        """True when the published rail slot is a MEASUREMENT: the track was seen
+        homed + enabled (connect gate, or a successful :meth:`home_rail`). False
+        for an arm without a rail and for a track connected with
+        ``rail_homing == "allow_unhomed"`` before it was homed — then
+        ``get_state().q[7] == rail_pos_m == 0.0`` is a placeholder (core's
+        ``ArmState`` needs a finite ``q[7]``; consumers MUST check this flag)."""
+        return self._rail is not None and self._rail.pos_known
+
+    @property
     def connect_warnings(self) -> list[str]:
         return list(self._connect_warnings)
 
@@ -412,16 +481,17 @@ class XArmDriver(ArmInterface):
                 "identity", f"{cfg.arm_id}: sn={sn!r}, expected {cfg.expected_sn!r}"
             )
         self._fw = read_fw_tuple(api)  # api.version_number, NOT the raw api.version string
-        # 3. clear latched state, backstops, enable (required order)
+        # 3a. clear latched state + backstops (volatile settings, the same writes
+        #     as the session-less apply_backstops maintenance op)
         api.clean_warn()
         api.clean_error()
         self._connect_warnings = apply_backstops(api, cfg)
-        api.motion_enable(True)
-        api.set_mode(0)
-        api.set_state(0)  # set_state(0) must follow every set_mode
-        self._phase = DriverPhase.READY
-        # 4. rail detection fixes dof
-        rail = RailController(api, cfg.rail_speed_mm_s)
+        # 4. rail detection fixes dof; an unhomed / unverifiable track REFUSES the
+        #    connect (phase-09c: the driver never homes — see rail.require_homed).
+        #    Evaluated BEFORE motion_enable: register reads need no enable, so a
+        #    refusal leaves the arm exactly as found (state 4, brakes engaged) and
+        #    the contract's "zero writes to the arm on an unhomed refusal" holds.
+        rail = RailController(api, cfg.rail_speed_mm_s, arm_id=cfg.arm_id)
         if cfg.expect_rail == "no":
             self._has_rail = False
         else:
@@ -432,8 +502,23 @@ class XArmDriver(ArmInterface):
             self._has_rail = detected
         self._connect_warnings.extend(rail.warnings)  # e.g. SN unverifiable (SDK 1.18.5)
         if self._has_rail:
-            rail.ensure_homed()
+            n_warnings = len(rail.warnings)
+            try:
+                # RailNotHomedError (on_zero 0, unless cfg.rail_homing == "allow_unhomed":
+                # phase-09d maintenance motion, the track stays DETECTED and the rail slot
+                # is a 0.0 placeholder until home_rail()) or BringupError("rail", ...)
+                # (register read / enable / speed failed); NEVER set_linear_track_back_origin
+                rail.require_homed(allow_unhomed=cfg.rail_homing == "allow_unhomed")
+            except BringupError:
+                self._phase = DriverPhase.IDLE
+                raise
+            self._connect_warnings.extend(rail.warnings[n_warnings:])  # "position unknown"
             self._rail = rail
+        # 3b. enable (required order: motion_enable -> set_mode -> set_state(0))
+        api.motion_enable(True)
+        api.set_mode(0)
+        api.set_state(0)  # set_state(0) must follow every set_mode
+        self._phase = DriverPhase.READY
         # 5. gripper backend + report callback
         self._gripper = make_gripper(cfg.gripper, self._clock)
         self._gripper.init(api, self._fw)  # raises GripperInitError
@@ -452,10 +537,7 @@ class XArmDriver(ArmInterface):
             report_cmd_num=True,
         )
         # 6. enter streaming; seed from the measured position
-        api.set_mode(1)
-        api.set_state(0)
-        self._mode_set_at = self._clock()
-        self._sleep(0.1)
+        self._enter_servo_mode()
         q_seed = self._read_measured_q()
         self._streamer = _ServoStreamer(
             api,
@@ -494,6 +576,47 @@ class XArmDriver(ArmInterface):
         raise ArmConnectError(
             "connect", f"{self.cfg.arm_id} ({self.cfg.ip}): {last_exc or 'not connected'}"
         )
+
+    def _await_servo_ready(self) -> int:
+        """Block (≤ :data:`SERVO_READY_TIMEOUT_S`) until the control box reports a
+        healthy servo state, then return that state.
+
+        Read-only polling: ``get_state()`` is a plain 502 read whose reply also
+        refreshes the SDK's "ready to move" flag, so the first
+        ``set_servo_angle_j`` is not the thing that discovers the box was still
+        entering servo mode (2026-09-05: a fixed 0.1 s sleep raced it and the
+        first tick of the first hardware session faulted the arm with APIState 9).
+        Returns the last state seen — the caller does NOT fault on a timeout, the
+        streamer's bounded grace window and its normal fault path cover that.
+        """
+        api = self._api
+        deadline = self._clock() + SERVO_READY_TIMEOUT_S
+        state = -1
+        # bounded by BOTH the deadline and the poll count: this runs inside connect()
+        # and recovery, so it must never be able to hang on a clock that stands still
+        for _ in range(SERVO_READY_MAX_POLLS):
+            try:
+                code, value = api.get_state()
+                if code == 0:
+                    state = int(value)
+            except Exception:  # noqa: BLE001 — a read failure must not mask mode entry
+                pass
+            if state in SERVO_HEALTHY_STATES or self._clock() >= deadline:
+                return state
+            self._sleep(SERVO_READY_POLL_S)
+        return state
+
+    def _enter_servo_mode(self) -> int:
+        """``set_mode(1)`` + ``set_state(0)`` + wait for readiness (§3.3).
+
+        The single place the driver enters mode 1 (connect, recovery, external
+        re-grab). Returns the controller state it settled on.
+        """
+        api = self._api
+        api.set_mode(1)
+        api.set_state(0)
+        self._mode_set_at = self._clock()
+        return self._await_servo_ready()
 
     def _read_measured_q(self) -> np.ndarray:
         """Measured joints; is_real needs fw >= 1.9.110, plain fallback otherwise."""
@@ -607,7 +730,71 @@ class XArmDriver(ArmInterface):
         self._check_not_latched()
         if not np.isfinite(pos_m):
             raise CommandError("command_rail got non-finite value")
+        if not self._rail.pos_known:
+            # an explicit rail move on a track of unknown position is a programming
+            # error (the rail slot of command_joints is dropped silently instead: the
+            # control loop's hold target must keep flowing during the maintenance motion)
+            raise CommandError(
+                f"{self.cfg.arm_id}: linear track not homed (position unknown) - home_rail() first"
+            )
         self._rail.set_target(float(pos_m))
+
+    # -- rail homing on a connected driver (phase-09d) ---------------------------
+    def home_rail(self) -> RailHomeOutcome:
+        """Home the linear track while the servo stream HOLDS the joints — MOTION:
+        the carriage drives to the track's zero end (the operator's LEFT, +X).
+
+        The runtime's rail-homing maintenance job calls this on ITS OWN thread
+        after it has (a) connected the driver with ``rail_homing ==
+        "allow_unhomed"`` and (b) pre-positioned the arm along a twin-planned,
+        rail-position-agnostic path; it blocks ≤ ``HOME_RAIL_SDK_WAIT_S`` (30 s)
+        + a few register round-trips. Threads: the 100 Hz ``_ServoStreamer``
+        keeps sending the hold posture (the SDK's per-instance command lock
+        serialises its ``set_servo_angle_j`` with the homing's modbus calls; the
+        SDK's homing wait is a 10 Hz register poll, not a held lock); the 5 Hz
+        ``_MonitorThread`` keeps polling errors / the gripper, and its
+        ``rail.step()`` is a no-op for the duration (homing latch, see
+        :class:`RailController`). The rail slot of ``command_joints`` is dropped
+        while homing and the target is cleared afterwards, so nothing queued
+        can move the carriage once the track becomes commandable.
+
+        Refused (``written=False``, nothing moved) unless the driver is
+        ``STREAMING`` (a FAULT / LATCHED arm is not held by the stream) with no
+        controller error latched; the track outcome itself is judged from the
+        REGISTERS only (``on_zero == 1 and is_enabled == 1 and error == 0``) —
+        success → rail ``READY``, position known (0.0 m), ``RailEvent``; failure
+        → ``RAIL_ERROR`` + ``RailEvent``, position still unknown. Raises
+        ``CommandError`` when not connected and ``RailUnavailableError`` without
+        a track. Re-homing a homed track is allowed.
+        """
+        if self._api is None or self._streamer is None or self._monitor is None:
+            raise CommandError(f"{self.cfg.arm_id}: driver not connected")
+        if not self._has_rail or self._rail is None:
+            raise RailUnavailableError(f"{self.cfg.arm_id} has no rail")
+        rail = self._rail
+        if self._phase is not DriverPhase.STREAMING:
+            return RailHomeOutcome(
+                False,
+                f"{self.cfg.arm_id}: rail homing refused: driver is {self._phase.value}, the "
+                "servo stream is not holding the joints (recover first) - nothing written",
+                phase=rail.phase.name,
+            )
+        if self._err_code != 0:
+            return RailHomeOutcome(
+                False,
+                f"{self.cfg.arm_id}: rail homing refused: controller error {self._err_code} is "
+                "latched - clear it first (nothing written)",
+                phase=rail.phase.name,
+            )
+        outcome = rail.home()
+        now = self._clock()
+        # emit here (not only from the 5 Hz monitor tick) so the caller can see the
+        # READY / RAIL_ERROR RailEvent right after home_rail() returns
+        for phase_name, rcode, detail in rail.drain_events():
+            self._emit(
+                RailEvent(self.cfg.arm_id, phase=phase_name, code=rcode, detail=detail, t_mono=now)
+            )
+        return outcome
 
     # -- fault funnel & recovery (§3.5) -----------------------------------------
     def _on_fault(self, source: str, code: int) -> None:
@@ -673,7 +860,7 @@ class XArmDriver(ArmInterface):
                 self._record_recovery(err, user_initiated)
                 return
             self._mode_set_at = self._clock()
-            self._sleep(0.1)
+            self._await_servo_ready()
             try:
                 q = self._read_measured_q()
             except ArmConnectError:
@@ -724,29 +911,32 @@ class XArmDriver(ArmInterface):
         return True
 
     def _handle_external(self, resume_from_fault: bool = False) -> None:
-        """Mode/state changed under us with no error code — UFACTORY Studio.
-        Pause, warn, retry mode 1 once; twice within 5 s -> LATCHED."""
+        """The arm left servo mode with no error code — something outside this
+        driver moved it (UFACTORY Studio "Live control" is the usual suspect, but
+        who holds port 18333 is invisible to us, so the text only reports what was
+        MEASURED). Pause, warn, retry mode 1 once; twice within 5 s -> LATCHED."""
         now = self._clock()
         snap = self._snap
+        mode = snap.mode if snap else -1
+        state = snap.state if snap else -1
         self._emit(
             StudioConflictWarning(
                 self.cfg.arm_id,
-                mode=snap.mode if snap else -1,
-                state=snap.state if snap else -1,
+                mode=mode,
+                state=state,
                 t_mono=now,
             )
         )
         if self._external_retry_at is not None and now - self._external_retry_at < 5.0:
-            self._latch("external mode/state conflict persisted (UFACTORY Studio?)")
+            self._latch(
+                f"arm left servo mode twice in 5 s (controller mode {mode} state {state}); "
+                "close UFACTORY Studio live control if it is open"
+            )
             return
         self._external_retry_at = now
-        api = self._api
         if self._streamer is not None:
             self._streamer.pause()
-        api.set_mode(1)
-        api.set_state(0)
-        self._mode_set_at = self._clock()
-        self._sleep(0.1)
+        self._enter_servo_mode()
         try:
             q = self._read_measured_q()
         except ArmConnectError:
@@ -839,7 +1029,14 @@ class XArmDriver(ArmInterface):
             self._record_recovery(self._err_code, user_initiated=True)
 
     def disconnect(self) -> None:
-        """Idempotent teardown; never raises (logs by returning silently)."""
+        """Idempotent teardown; never raises (logs by returning silently).
+
+        Hands the arm back in the power-on posture "stopped, brakes engaged"
+        (phase-09c D6): after the threads stop, ``set_mode(0)`` ->
+        ``set_state(4)`` -> ``motion_enable(False)``. The linear track is left
+        alone — it keeps its homed flag (no ``set_linear_track_enable(False)``),
+        so the next session needs no re-homing.
+        """
         api, self._api = self._api, None
         if api is None:
             return
@@ -847,7 +1044,8 @@ class XArmDriver(ArmInterface):
             lambda: self._streamer.stop() if self._streamer else None,
             lambda: self._monitor.stop() if self._monitor else None,
             lambda: api.set_mode(0),
-            lambda: api.set_state(0),
+            lambda: api.set_state(4),  # stop (SDK: state 4 = stopped)
+            lambda: api.motion_enable(False),  # brakes engaged, as found at power-on
             lambda: self._gripper.close() if self._gripper else None,
             lambda: api.disconnect(),
         ):
@@ -927,13 +1125,16 @@ class _MonitorThread:
             elif err != 0 and d._phase == DriverPhase.STREAMING:
                 d._on_fault("monitor", err)
                 return
-        # 3. external mode/state grab (Studio) — no error code
+        # 3. the arm left servo mode with no error code (external actor, e.g. Studio
+        #    "Live control"). Mode 0/2 = someone took position/teach control; state
+        #    3/4/5/6 = someone paused or stopped it. **State 2 (standby) is HEALTHY**
+        #    and is what a held mode-1 arm reports — see SERVO_HEALTHY_STATES.
         snap = d._snap
         if (
             d._phase == DriverPhase.STREAMING
             and snap is not None
             and d._err_code == 0
-            and (snap.mode != 1 or snap.state not in (0, 1))
+            and (snap.mode != 1 or snap.state in SERVO_CONFLICT_STATES)
             and (d._clock() - snap.mono_ts) <= d.cfg.stale_after_s
             and (d._clock() - d._mode_set_at) > 0.5  # reports lag our set_mode(1)
         ):

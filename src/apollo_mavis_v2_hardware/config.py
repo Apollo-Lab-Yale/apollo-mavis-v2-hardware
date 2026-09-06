@@ -21,13 +21,20 @@ XARM7_JOINT_LIMITS_RAD: tuple[tuple[float, float], ...] = (
 
 
 class ServoLimits(BaseModel):
-    """Per-tick limits owned by the mode-1 servo streamer (no firmware smoothing)."""
+    """Per-tick limits owned by the mode-1 servo streamer (no firmware smoothing).
+
+    The defaults are the HARDWARE CAPS at ``SessionSpec.speed_scale == 1.0``
+    (phase-09c D2, first live runs): 0.3 rad/s per joint and 2 mm per 10 ms tick
+    (0.2 m/s TCP). The runtime multiplies ``max_joint_vel`` and
+    ``max_cart_step_m`` by the session's ``speed_scale`` (default 0.1) inside its
+    ``driver_factory`` closure; the firmware's own limit is 10 mm/tick.
+    """
 
     rate_hz: float = 100.0
-    max_joint_vel: tuple[float, ...] = tuple([1.0] * 7)  # rad/s (per-tick slew = vel*dt)
+    max_joint_vel: tuple[float, ...] = tuple([0.3] * 7)  # rad/s cap (per-tick slew = vel*dt)
     max_joint_acc: tuple[float, ...] = tuple([20.0] * 7)  # rad/s^2 (prevents C24 on steps)
     lever_arm_m: tuple[float, ...] = (1.20, 1.20, 1.00, 0.75, 0.44, 0.30, 0.10)
-    max_cart_step_m: float = 0.009  # firmware hard limit 10 mm/tick; keep margin
+    max_cart_step_m: float = 0.002  # 0.2 m/s TCP cap (D2); firmware hard limit 10 mm/tick
     joint_limit_margin_rad: float = 0.0087  # 0.5 deg inside limits (avoids -8)
     joint_limits_rad: tuple[tuple[float, float], ...] = XARM7_JOINT_LIMITS_RAD
 
@@ -47,7 +54,21 @@ class ServoLimits(BaseModel):
 
 
 class XArmDriverConfig(BaseModel):
-    """One arm; one XArmAPI(ip, is_radian=True, report_type='real') per driver."""
+    """One arm; one XArmAPI(ip, is_radian=True, report_type='real') per driver.
+
+    ``servo`` and ``rail_speed_mm_s`` are the speed-scale-1.0 hardware caps
+    (phase-09c D2); the runtime's ``driver_factory`` scales them per session.
+    ``connect()`` never homes the rail. With the default ``rail_homing ==
+    "require_homed"`` it requires ``on_zero == 1`` (``RailNotHomedError``
+    otherwise) — a normal session homes beforehand through the monitor's
+    operator-triggered ``home_rail`` maintenance op. ``"allow_unhomed"``
+    (phase-09d) is for the runtime's rail-homing MAINTENANCE MOTION only: the
+    connect proceeds with an unhomed track (``dof`` stays 8, the rail phase stays
+    ``DETECTED``, ``XArmDriver.rail_position_known`` is False and the published
+    rail slot reads 0.0 m as a placeholder) so the runtime can pre-position the
+    arm along a twin-planned, rail-position-agnostic path and then call
+    ``XArmDriver.home_rail()`` while the servo stream holds the joints.
+    """
 
     arm_id: str
     ip: str
@@ -59,7 +80,10 @@ class XArmDriverConfig(BaseModel):
     reduced_tcp_boundary_mm: tuple[int, int, int, int, int, int] | None = None
     # optional [x_max, x_min, y_max, y_min, z_max, z_min] base-frame envelope
     # (11-safety §11); None = reduced mode off
-    rail_speed_mm_s: int = 200
+    rail_speed_mm_s: int = 50  # positioning speed cap at scale 1.0 (D2); track max 200
+    # phase-09d: "allow_unhomed" ONLY for the runtime's rail-homing maintenance motion
+    # (see the class docstring); every normal session keeps "require_homed"
+    rail_homing: Literal["require_homed", "allow_unhomed"] = "require_homed"
     servo: ServoLimits = ServoLimits()
     monitor_rate_hz: float = 5.0
     stale_after_s: float = 0.15  # 30003 silence => ArmState.stale

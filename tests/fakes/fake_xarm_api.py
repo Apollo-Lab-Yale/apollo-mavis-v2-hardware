@@ -15,6 +15,21 @@ rail returns code 3; a simulation-mode controller answers track reads with
 ``(0, [])`` without touching the bus. Records ``sent_joints`` + a ``calls``
 log of every mutating call; ``emit_report`` (or the optional 30003 stream
 reader) fires registered report callbacks.
+
+Linear-track homing (phase-09c) mirrors ``x3/linear_motor.py:131-148`` +
+``:242-261``: ``set_linear_track_back_origin(wait=True, **kwargs)`` blocks for
+``homing_duration_s`` (honouring the ``timeout`` kwarg — SDK default 10 s — and
+``self.connected``, exactly like ``__wait_linear_motor_back_origin``), returns
+0 / 80 (track error) / 100 (timeout or link lost), then, when ``auto_enable``
+(SDK default True!) OVERWRITES that code with the enable's return code —
+``homing_result_code`` forces the wait result for tests that pin
+"judge from registers, not from the code". ``inject_track_error(code)`` sets the
+track error register (enable fails with 80, homing aborts with 80);
+``homing_track_error`` (phase-09d) trips that register when the carriage would
+have reached the zero end (wait returns 80, ``on_zero`` stays 0);
+``rail_homed`` / ``rail_enabled`` are settable properties. The fake is used
+from several threads at once (servo streamer, monitor, a homing caller):
+every mutating call is a plain attribute write or list append under the GIL.
 """
 
 from __future__ import annotations
@@ -52,6 +67,12 @@ class FaultScript:
     error_code: int = 24
     servo_return: int = 1
     drop_mode_to_0: bool = True
+    # Entering servo mode is not atomic on the real box: this many
+    # set_servo_angle_j calls right after readiness answer APIState 9
+    # (STATE_NOT_READY) before the first one lands. Reproduces 2026-09-05, when the
+    # driver's blind sleep(0.1) after set_state(0) raced the controller and the very
+    # first tick of the first hardware session faulted an arm during bring-up.
+    not_ready_ticks: int = 0
 
 
 class FakeXArmAPI:
@@ -95,6 +116,9 @@ class FakeXArmAPI:
         connect_delay_s: float = 0.0,
         collision_sensitivity: int = 0,
         tcp_load: tuple[float, tuple[float, float, float]] = (0.0, (0.0, 0.0, 0.0)),
+        homing_duration_s: float = 0.0,
+        homing_result_code: int | None = None,
+        homing_track_error: int | None = None,
         clock: Callable[[], float] = time.monotonic,
         **kwargs: Any,
     ) -> None:
@@ -116,7 +140,16 @@ class FakeXArmAPI:
         self.sn = sn
         self.version = version  # RAW controller string, like the SDK property
         self.mode = 0  # SDK: updated by the report thread, never in the payload
-        self.state = 2  # sleeping/standby after a fresh connect
+        # Controller STATE, as the real boxes report it: 0 ready, 1 in motion,
+        # 2 standby ("sleeping"), 3 paused, 4/5 stopped, 6 decelerating. A fresh box
+        # is 2; a HELD mode-1 arm is ALSO 2 (measured on both lab boxes 2026-09-05)
+        # — re-sending the same posture is not "motion". Readiness is a SEPARATE
+        # flag on the wire (``ready_to_move``, the 0x10 bit of every TCP reply that
+        # the SDK exposes as ``UxbusCmd.state_is_ready``), not a state value: that
+        # split is why the driver must not infer "somebody grabbed the arm" from
+        # ``state != 0``.
+        self.state = 2
+        self.ready_to_move = False  # set_state(0) after motion_enable + set_mode
         self.error_code = 0
         self.warn_code = 0
         self.motion_enabled = False
@@ -153,6 +186,17 @@ class FakeXArmAPI:
         self._rail_speed = 0
         self._rail_error = 0
         self.rail_pos_commands: list[int] = []
+        # homing (phase-09c): how long the carriage "travels" to the zero end; None
+        # -> the wait result follows the SDK rules, else this code is returned
+        # as the wait result (auto_enable may still overwrite it, like the SDK)
+        self.homing_duration_s = float(homing_duration_s)
+        self.homing_result_code = homing_result_code
+        # phase-09d: the carriage trips this track error (e.g. 25/26 over-travel)
+        # mid-travel: the wait returns 80, on_zero stays 0, the enable then fails
+        self.homing_track_error = homing_track_error
+        self.homing_started = 0  # set_linear_track_back_origin calls that reached the track
+        self.homing_completed = 0  # times on_zero flipped to 1 through homing
+        self._homing = False  # carriage travelling (status bit 0)
         # report plumbing
         self._callbacks: list[tuple[Callable[[dict], None], dict[str, bool]]] = []
         self._auto_report_hz = auto_report_hz
@@ -185,6 +229,36 @@ class FakeXArmAPI:
         if drop_mode:
             self.mode = 0  # errors silently reset the controller to mode 0
             self.state = 4
+            self.ready_to_move = False
+
+    def inject_track_error(self, code: int) -> None:
+        """Latch a linear-track error register (e.g. 25/26 over-travel). The
+        track drops its enable; ``set_linear_track_enable`` answers 80 until
+        ``clean_linear_track_error()``; a homing in flight aborts with 80."""
+        self._rail_error = int(code)
+        if code:
+            self._rail_enabled = False
+
+    @property
+    def rail_homed(self) -> bool:
+        """``on_zero == 1``; settable (power-cycle -> False, Studio homing -> True)."""
+        return self._rail_on_zero == 1
+
+    @rail_homed.setter
+    def rail_homed(self, value: bool) -> None:
+        self._rail_on_zero = 1 if value else 0
+
+    @property
+    def rail_enabled(self) -> bool:
+        return self._rail_enabled
+
+    @rail_enabled.setter
+    def rail_enabled(self, value: bool) -> None:
+        self._rail_enabled = bool(value)
+
+    @property
+    def rail_error(self) -> int:
+        return self._rail_error
 
     # -- lifecycle / mode / state -------------------------------------------------
     def connect(self, port: str | None = None, **kwargs: Any) -> None:
@@ -225,17 +299,30 @@ class FakeXArmAPI:
     def set_mode(self, mode: int = 0, detection_param: int = 0) -> int:
         self._rec("set_mode", mode)
         self.mode = mode
-        self.state = 2  # mode change moves state out of ready
+        self.state = 2  # standby
+        self.ready_to_move = False  # every set_mode needs a set_state(0) after it
         return 0
+
+    def get_state(self) -> tuple[int, int]:
+        """SDK ``get_state()`` -> (code, state); a plain 502 read (the reply also
+        refreshes the SDK's ready-to-move flag, which is why the driver polls it
+        instead of sleeping a fixed time after entering servo mode). Recorded so
+        tests can pin "readiness is polled, not slept for"."""
+        self._rec("get_state")
+        return 0, self.state
 
     def set_state(self, state: int = 0) -> int:
         self._rec("set_state", state)
         if state == 0:
             if self.motion_enabled and self.error_code == 0:
-                self.state = 0
+                # ready to accept motion, but the REPORTED state is standby until
+                # something actually moves — the real box never idles in state 0
+                self.state = 2
+                self.ready_to_move = True
             # else: stays not-ready (latched error / not enabled)
         else:
             self.state = state
+            self.ready_to_move = False
         return 0
 
     def get_err_warn_code(self, show: bool = False, **kwargs: Any) -> tuple[int, list[int]]:
@@ -254,6 +341,7 @@ class FakeXArmAPI:
     def emergency_stop(self) -> None:
         self._rec("emergency_stop")
         self.state = 4
+        self.ready_to_move = False
 
     # -- mode-1 servo streaming -----------------------------------------------------
     def set_servo_angle_j(
@@ -273,8 +361,11 @@ class FakeXArmAPI:
             return script.servo_return
         if self.error_code != 0:
             return 1  # HAS_ERROR until cleaned
-        if self.mode != 1 or self.state != 0 or not self.motion_enabled:
-            return 9  # state not ready
+        if self.mode != 1 or not self.ready_to_move or not self.motion_enabled:
+            return 9  # STATE_NOT_READY (the reply's 0x10 bit)
+        if script is not None and script.not_ready_ticks > 0:
+            script.not_ready_ticks -= 1
+            return 9  # still entering servo mode (see FaultScript.not_ready_ticks)
         if self.check_joint_limit:
             for value, (lo, hi) in zip(angles[:7], XARM7_LIMITS, strict=False):
                 if not lo <= float(value) <= hi:
@@ -409,7 +500,7 @@ class FakeXArmAPI:
             return 3, {}  # response timeout: nothing on the RS-485 bus
         return 0, {
             "pos": self._rail_pos_mm,
-            "status": 0 if self._rail_on_zero else 2,
+            "status": (0 if self._rail_on_zero else 2) | (1 if self._homing else 0),
             "error": self._rail_error,
             "is_enabled": int(self._rail_enabled),
             "on_zero": self._rail_on_zero,
@@ -418,25 +509,94 @@ class FakeXArmAPI:
         }
 
     def get_linear_track_on_zero(self) -> tuple[int, int]:
+        if not self._rail_present:
+            return 3, 0
         return 0, self._rail_on_zero
 
     def set_linear_track_back_origin(self, wait: bool = True, **kwargs: Any) -> int:
-        self._rec("set_linear_track_back_origin", wait=wait)
+        """SDK 1.18.5 ``set_linear_motor_back_origin``: kwargs ``auto_enable``
+        (default True) and ``timeout`` (default 10). The homing write goes out,
+        then (``wait``) the register poll loop; then ``auto_enable`` OVERWRITES the
+        code with the enable's; finally 80 if the track error register is set."""
+        auto_enable = bool(kwargs.get("auto_enable", True))
+        timeout = kwargs.get("timeout", 10)
+        self._rec("set_linear_track_back_origin", wait=wait, **kwargs)
+        if self.simulation_robot:
+            return 0  # @xarm_is_not_simulation_mode: bus untouched
+        if not self._rail_present:
+            return 3  # modbus timeout
+        if not timeout or not isinstance(timeout, (int, float)) or timeout <= 0:
+            timeout = 10  # SDK default
+        self.homing_started += 1
+        code = 0
+        if self._rail_error:
+            code = 80  # the wait loop returns LINEAR_MOTOR_HAS_FAULT right away
+        elif wait:
+            code = self._wait_back_origin(float(timeout))
+        else:
+            self._finish_homing()  # no dynamics on the non-blocking path
+        if self.homing_result_code is not None:
+            code = int(self.homing_result_code)
+        if auto_enable:
+            code = self._enable_track(True)  # SDK: ret[0] = set_linear_motor_enable(True)
+        return code if self._rail_error == 0 else 80
+
+    def _wait_back_origin(self, timeout: float) -> int:
+        """``__wait_linear_motor_back_origin``: 0 on on_zero, 80 on a track error,
+        100 on timeout — and 100 when ``connected`` drops (the loop condition)."""
+        self._homing = True
+        try:
+            deadline = time.monotonic() + timeout
+            done_at = time.monotonic() + self.homing_duration_s
+            while self.connected and time.monotonic() < deadline:
+                if self._rail_error:
+                    return 80
+                if time.monotonic() >= done_at:
+                    if self.homing_track_error:
+                        self.inject_track_error(int(self.homing_track_error))
+                        return 80  # LINEAR_MOTOR_HAS_FAULT: carriage stopped short
+                    self._finish_homing()
+                    return 0
+                time.sleep(0.002)  # the SDK polls the registers every 0.1 s
+            return 100  # WAIT_FINISH_TIMEOUT (also the exit code when the link drops)
+        finally:
+            self._homing = False
+
+    def _finish_homing(self) -> None:
         self._rail_on_zero = 1
         self._rail_pos_mm = 0
+        self.homing_completed += 1
+
+    def _enable_track(self, enable: bool) -> int:
+        """``set_linear_motor_enable`` semantics: with a track error latched the
+        enable does not take and the code is 80."""
+        if self._rail_error:
+            self._rail_enabled = False
+            return 80
+        self._rail_enabled = bool(enable)
         return 0
 
     def set_linear_track_enable(self, enable: bool) -> int:
         self._rec("set_linear_track_enable", enable)
-        self._rail_enabled = bool(enable)
-        return 0
+        if not self._rail_present:
+            return 3
+        return self._enable_track(enable)
 
     def set_linear_track_speed(self, speed: int) -> int:
         self._rec("set_linear_track_speed", speed)
+        if not self._rail_present:
+            return 3
         self._rail_speed = int(speed)
         return 0
 
+    @property
+    def rail_speed(self) -> int:
+        """Positioning speed last written (mm/s); 0 until set."""
+        return self._rail_speed
+
     def get_linear_track_pos(self) -> tuple[int, int]:
+        if not self._rail_present:
+            return 3, 0
         return 0, self._rail_pos_mm
 
     def set_linear_track_pos(self, pos: int, wait: bool = True, **kwargs: Any) -> int:
@@ -449,6 +609,7 @@ class FakeXArmAPI:
 
     def clean_linear_track_error(self) -> int:
         self._rec("clean_linear_track_error")
+        self._rail_error = 0
         return 0
 
     # -- report stream -----------------------------------------------------------------------
