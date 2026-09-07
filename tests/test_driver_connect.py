@@ -340,14 +340,16 @@ def test_disconnect_hands_the_arm_back_stopped_and_braked_and_leaves_the_track_a
     assert drv.phase is DriverPhase.IDLE
 
 
-def test_default_driver_caps_are_the_phase_09c_first_run_values() -> None:
-    """D2: hardware caps at speed_scale 1.0 — 0.3 rad/s, 2 mm/tick (0.2 m/s), rail 50 mm/s.
-    The runtime scales these per session; the streamer must honour them on the wire."""
+def test_default_driver_caps_are_the_d2_values() -> None:
+    """D2: hardware caps at speed_scale 1.0 — 0.6 rad/s, 4 mm/tick (0.4 m/s), rail 50 mm/s
+    (raised 2026-09-07 from the first-run 0.3 / 2 mm; 4 mm stays half the gate's 8 mm
+    inflation). The runtime scales these per session; the streamer must honour them on the wire."""
     cfg = XArmDriverConfig(arm_id="a1", ip="192.168.1.235")
-    assert cfg.servo.max_joint_vel == (0.3,) * 7
-    assert cfg.servo.max_cart_step_m == 0.002
+    assert cfg.servo.max_joint_vel == (0.6,) * 7
+    assert cfg.servo.max_cart_step_m == 0.004
     assert cfg.rail_speed_mm_s == 50
-    assert ServoLimits().max_joint_vel == (0.3,) * 7 and ServoLimits().max_cart_step_m == 0.002
+    assert ServoLimits().max_joint_vel == (0.6,) * 7 and ServoLimits().max_cart_step_m == 0.004
+    assert ServoLimits().max_cart_step_m <= 0.008 / 2  # never more than half the gate inflation
     drv, h = make_driver(fake_kwargs={"has_rail": True, "rail_homed": True})
     try:
         api = h["api"]
@@ -356,7 +358,8 @@ def test_default_driver_caps_are_the_phase_09c_first_run_values() -> None:
         wait_until(lambda: len(api.sent_joints) >= 12, msg="streamer never ticked")
         sent = [np.asarray(q) for _, q in api.sent_joints[:12]]
         dq = np.diff(np.stack(sent), axis=0)
-        assert np.all(np.abs(dq) <= 0.3 / cfg.servo.rate_hz + 1e-9)  # per-joint vel cap
+        vel_cap = cfg.servo.max_joint_vel[0] / cfg.servo.rate_hz
+        assert np.all(np.abs(dq) <= vel_cap + 1e-9)  # per-joint vel cap
         lever = np.asarray(cfg.servo.lever_arm_m)
         assert np.all(np.abs(dq) @ lever <= cfg.servo.max_cart_step_m + 1e-9)  # TCP cap
     finally:

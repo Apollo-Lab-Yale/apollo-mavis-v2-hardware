@@ -24,17 +24,22 @@ class ServoLimits(BaseModel):
     """Per-tick limits owned by the mode-1 servo streamer (no firmware smoothing).
 
     The defaults are the HARDWARE CAPS at ``SessionSpec.speed_scale == 1.0``
-    (phase-09c D2, first live runs): 0.3 rad/s per joint and 2 mm per 10 ms tick
-    (0.2 m/s TCP). The runtime multiplies ``max_joint_vel`` and
-    ``max_cart_step_m`` by the session's ``speed_scale`` (default 0.1) inside its
-    ``driver_factory`` closure; the firmware's own limit is 10 mm/tick.
+    (phase-09c D2): **0.6 rad/s per joint and 4 mm per 10 ms tick (0.4 m/s TCP)**
+    since 2026-09-07 - the first live runs used 0.3 rad/s / 2 mm (0.2 m/s) and the
+    operator found 100 % "still very slow, over-conservative". The Cartesian step
+    is deliberately kept at HALF the gate's 8 mm geometry inflation
+    (``SafetyConfig.geom_inflation_m``): the twin gate checks the commanded
+    posture once per tick, so one tick must never be able to cross the inflated
+    shell - 10 mm/tick (the firmware's own limit) would. The runtime multiplies
+    ``max_joint_vel`` and ``max_cart_step_m`` by the session's ``speed_scale``
+    (default 0.1) inside its ``driver_factory`` closure.
     """
 
     rate_hz: float = 100.0
-    max_joint_vel: tuple[float, ...] = tuple([0.3] * 7)  # rad/s cap (per-tick slew = vel*dt)
+    max_joint_vel: tuple[float, ...] = tuple([0.6] * 7)  # rad/s cap (per-tick slew = vel*dt)
     max_joint_acc: tuple[float, ...] = tuple([20.0] * 7)  # rad/s^2 (prevents C24 on steps)
     lever_arm_m: tuple[float, ...] = (1.20, 1.20, 1.00, 0.75, 0.44, 0.30, 0.10)
-    max_cart_step_m: float = 0.002  # 0.2 m/s TCP cap (D2); firmware hard limit 10 mm/tick
+    max_cart_step_m: float = 0.004  # 0.4 m/s TCP cap (D2); half the 8 mm gate inflation
     joint_limit_margin_rad: float = 0.0087  # 0.5 deg inside limits (avoids -8)
     joint_limits_rad: tuple[tuple[float, float], ...] = XARM7_JOINT_LIMITS_RAD
 
