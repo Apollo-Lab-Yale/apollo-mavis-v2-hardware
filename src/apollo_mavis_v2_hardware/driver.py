@@ -3,6 +3,13 @@
 One driver per arm; one ``XArmAPI(ip, is_radian=True, report_type='real')``
 per driver (never shared across arms/processes). ``XArmAPI`` is imported ONLY
 here (injected everywhere else via ``api_factory``).
+
+Phase-12 (02-hardware §4 additive; 14-dora §4.2 "Arm states without a
+session"): ``connect(readonly=True)`` opens the same report stream but NEVER
+writes to the control box — no enable, no mode/state change, no servo stream,
+no gripper / rail writes, no error clearing; ``READONLY_ALLOWED_SDK_METHODS``
+is the complete SDK surface that path may call. The runtime's ``IdleArmReader``
+holds such a connection to each box between sessions.
 """
 
 from __future__ import annotations
@@ -62,6 +69,9 @@ class DriverPhase(Enum):
     FAULT = "fault"
     RECOVERING = "recovering"
     LATCHED = "latched"
+    # phase-12: connected with connect(readonly=True) — report stream + read-only
+    # polling only; the box is never enabled, never commanded, never cleared
+    READONLY = "readonly"
 
 
 class FaultKind(Enum):
@@ -112,6 +122,34 @@ SERVO_READY_TIMEOUT_S = 1.5
 SERVO_READY_POLL_S = 0.02
 SERVO_READY_MAX_POLLS = int(SERVO_READY_TIMEOUT_S / SERVO_READY_POLL_S) + 2
 SERVO_NOT_READY_GRACE_S = 0.3
+
+# ---------------------------------------------------------------------------
+# READ-ONLY CONNECTION ALLOWLIST (phase-12): the COMPLETE set of XArmAPI methods
+# ``connect(readonly=True)`` + its poll thread + get_state() / stop() /
+# disconnect() may call. Everything a driving session writes — clean_*,
+# motion_enable, set_mode / set_state, set_servo_angle_j, the backstop set_*,
+# every gripper / linear-track set_* and save_conf — is absent by construction;
+# tests/test_driver_readonly.py asserts the fake's call log stays inside this set.
+# ``get_linear_track_registers`` / ``get_gripper_*_position`` are the same reads
+# as the read-only monitor's (``monitor.READ_ONLY_SDK_METHODS``). The joint
+# angles come from the 30003 report stream (``register_report_callback`` is a
+# subscription on the SDK's own socket, not a controller write), so no
+# ``get_servo_angle`` polling is needed.
+# ---------------------------------------------------------------------------
+READONLY_ALLOWED_SDK_METHODS: frozenset[str] = frozenset(
+    {
+        "disconnect",
+        "register_report_callback",  # 30003 push subscription (joints, tcp, state)
+        "get_err_warn_code",  # [error_code, warn_code] — the stream carries none
+        "get_linear_track_registers",  # {pos, status, error, is_enabled, on_zero}
+        "get_gripper_position",  # classic: pulses — same read as ClassicGripper.poll()
+        "get_gripper_g2_position",  # G2: int mm — same read as G2Gripper.poll()
+    }
+)
+# XArmAPI attributes the read-only path reads (SDK properties fed by its threads).
+READONLY_ALLOWED_SDK_ATTRS: frozenset[str] = frozenset(
+    {"connected", "sn", "version", "version_number", "mode", "joints_torque"}
+)
 
 
 def classify_error(err: int) -> FaultKind:
@@ -367,6 +405,9 @@ class XArmDriver(ArmInterface):
         self._phase_lock = threading.Lock()
         self._streamer: _ServoStreamer | None = None
         self._monitor: _MonitorThread | None = None
+        self._poller: _ReadonlyPoller | None = None  # connect(readonly=True) only
+        self._readonly = False
+        self._readonly_poll_ok = True  # False after a failed read-only poll -> stale
         self._rail: RailController | None = None
         self._gripper: GripperBackend | None = None
         self._has_rail = False
@@ -403,6 +444,13 @@ class XArmDriver(ArmInterface):
         return self._phase
 
     @property
+    def readonly(self) -> bool:
+        """True when this driver was (last) opened with ``connect(readonly=True)``:
+        it publishes state but never writes — every ``command_*`` raises
+        ``CommandError`` and ``stop()`` / ``disconnect()`` skip the D6 writes."""
+        return self._readonly
+
+    @property
     def dof(self) -> int:
         return 8 if self._has_rail else 7
 
@@ -437,11 +485,12 @@ class XArmDriver(ArmInterface):
     @property
     def rail_position_known(self) -> bool:
         """True when the published rail slot is a MEASUREMENT: the track was seen
-        homed + enabled (connect gate, or a successful :meth:`home_rail`). False
-        for an arm without a rail and for a track connected with
-        ``rail_homing == "allow_unhomed"`` before it was homed — then
-        ``get_state().q[7] == rail_pos_m == 0.0`` is a placeholder (core's
-        ``ArmState`` needs a finite ``q[7]``; consumers MUST check this flag)."""
+        homed + enabled (connect gate, a successful :meth:`home_rail`, or — on a
+        read-only connection — the last register poll). False for an arm without
+        a rail and for a track connected with ``rail_homing == "allow_unhomed"``
+        (or read-only) before it was homed + enabled — then ``get_state().q[7]
+        == rail_pos_m == 0.0`` is a placeholder (core's ``ArmState`` needs a
+        finite ``q[7]``; consumers MUST check this flag)."""
         return self._rail is not None and self._rail.pos_known
 
     @property
@@ -468,8 +517,15 @@ class XArmDriver(ArmInterface):
             self._events.append(event)
 
     # -- bring-up (§3.2) -------------------------------------------------------
-    def connect(self) -> None:
+    def connect(self, readonly: bool = False) -> None:
+        """Bring the arm up for a driving session (default) or, with
+        ``readonly=True`` (phase-12), open a state-only connection — see
+        :meth:`_connect_readonly`. The default path is unchanged."""
         cfg = self.cfg
+        self._readonly = bool(readonly)
+        if readonly:
+            self._connect_readonly()
+            return
         self._phase = DriverPhase.CONNECTING
         api = self._connect_api()
         self._api = api
@@ -553,6 +609,112 @@ class XArmDriver(ArmInterface):
         self._monitor = _MonitorThread(self)
         self._monitor.start()
         self._phase = DriverPhase.STREAMING
+
+    def _connect_readonly(self) -> None:
+        """``connect(readonly=True)`` (02-hardware §4 additive; 14-dora §4.2).
+
+        Same ``XArmAPI(..., report_type='real', enable_report=True)`` client and
+        identity / firmware reads as a normal connect, then ONLY:
+        ``register_report_callback`` (joints, tcp pose, state at 100 Hz -> the
+        same ``_StateSnap`` ``get_state()`` reads today), one read of the
+        linear-track registers (presence fixes ``dof``; ``rail_position_known``
+        iff ``on_zero == 1 and is_enabled == 1``, else the rail slot publishes the
+        0.0 placeholder like the phase-09d ``allow_unhomed`` case — never
+        ``require_homed``, never enable / speed / home), one read of the gripper
+        opening (``get_gripper_position`` / ``get_gripper_g2_position``, mapped
+        like the backends; the classic backend's ``init`` writes are skipped) and
+        ``get_err_warn_code``; then a read-only poll thread at
+        ``cfg.monitor_rate_hz`` refreshes those three. Phase ``READONLY``.
+
+        NOT called, by construction: ``clean_warn`` / ``clean_error``,
+        ``apply_backstops``, ``motion_enable``, ``set_mode`` / ``set_state``,
+        ``set_servo_angle_j`` (no ``_ServoStreamer``), no ``_MonitorThread`` (its
+        recovery path writes), no gripper / track ``set_*``. A controller error
+        is REPORTED (``ArmState.error_code``), never recovered. The complete
+        callable surface is :data:`READONLY_ALLOWED_SDK_METHODS`. ``expected_sn``
+        and ``expect_rail == "yes"`` refuse exactly as the driving connect does.
+        """
+        cfg = self.cfg
+        self._phase = DriverPhase.CONNECTING
+        api = self._connect_api()
+        self._api = api
+        sn = getattr(api, "sn", None)
+        if cfg.expected_sn is not None and sn != cfg.expected_sn:
+            self._phase = DriverPhase.IDLE
+            raise ArmIdentityError(
+                "identity", f"{cfg.arm_id}: sn={sn!r}, expected {cfg.expected_sn!r}"
+            )
+        self._fw = read_fw_tuple(api)
+        self._connect_warnings = []
+        # SDK 1.18.5 keywords only (see connect()); a subscription on the SDK's own
+        # report socket, not a controller write
+        api.register_report_callback(
+            self._on_report,
+            report_cartesian=True,
+            report_joints=True,
+            report_state=True,
+            report_error_code=False,
+            report_warn_code=False,
+            report_mtable=False,
+            report_mtbrake=False,
+            report_cmd_num=True,
+        )
+        # rail: ONE register read (detect keeps the dict) -> dof + position bookkeeping;
+        # never require_homed (the gate enables + sets the speed on a homed track)
+        rail = RailController(api, cfg.rail_speed_mm_s, arm_id=cfg.arm_id)
+        if cfg.expect_rail == "no":
+            self._has_rail = False
+        else:
+            detected = rail.detect()
+            if cfg.expect_rail == "yes" and not detected:
+                self._phase = DriverPhase.IDLE
+                raise RailExpectedError("rail", f"{cfg.arm_id}: expected rail not detected")
+            self._has_rail = detected
+        self._connect_warnings.extend(rail.warnings)
+        if self._has_rail:
+            rail.observe_registers(rail.last_registers)
+            if not rail.pos_known:
+                self._connect_warnings.append(
+                    f"{cfg.arm_id}: linear track not homed + enabled: carriage position "
+                    "UNKNOWN - rail slot reads 0.000 m as a placeholder (read-only connection)"
+                )
+            self._rail = rail
+        # gripper opening + error codes once, so the first get_state() is complete
+        self._gripper = None  # no backend: its init()/poll() write (enable, clean)
+        self._read_gripper_readonly()
+        self._read_err_warn_readonly()
+        self._readonly_poll_ok = True
+        self._poller = _ReadonlyPoller(self)
+        self._poller.start()
+        self._phase = DriverPhase.READONLY
+
+    def _read_err_warn_readonly(self) -> None:
+        code, ew = self._api.get_err_warn_code()
+        if code == 0 and ew is not None and len(ew) >= 2:
+            self._err_code, self._warn_code = int(ew[0]), int(ew[1])
+
+    def _read_gripper_readonly(self) -> None:
+        """Gripper opening via the SAME read + conversion as the backends' poll()
+        (and the read-only monitor), without the backends' writes."""
+        kind = self.cfg.gripper
+        if kind == "none":
+            return
+        if kind == "xarm_g2":
+            code, mm = self._api.get_gripper_g2_position()
+            if code == 0 and mm is not None:
+                self._gripper_state = GripperState(open_frac=units.g2_mm_to_frac(mm))
+        else:
+            code, pulse = self._api.get_gripper_position()
+            if code == 0 and pulse is not None:
+                self._gripper_state = GripperState(open_frac=units.pulse_to_frac(pulse))
+
+    def _read_rail_readonly(self) -> None:
+        """Refresh the rail bookkeeping from the registers; a failed read = unknown."""
+        rail = self._rail
+        if rail is None:
+            return
+        code, regs = self._api.get_linear_track_registers()
+        rail.observe_registers(regs if code == 0 else None)
 
     def _connect_api(self) -> Any:
         last_exc: Exception | None = None
@@ -676,6 +838,8 @@ class XArmDriver(ArmInterface):
             mode, state = snap.mode, snap.state
             mono_ts, wall = snap.mono_ts, snap.wallclock_ns
             stale = (now - snap.mono_ts) > self.cfg.stale_after_s
+        if not self._readonly_poll_ok:
+            stale = True  # read-only poll failed / link lost (phase-12): never trust it
         if rail is not None:
             q = np.concatenate([q7, [rail_pos]])
             dq = np.concatenate([dq7, [0.0]])  # rail velocity unobservable
@@ -705,7 +869,13 @@ class XArmDriver(ArmInterface):
                 "call clear_errors() to recover"
             )
 
+    def _check_writable(self) -> None:
+        """A read-only connection (phase-12) never commands: CommandError."""
+        if self._readonly:
+            raise CommandError(f"{self.cfg.arm_id}: read-only connection")
+
     def command_joints(self, q: np.ndarray) -> None:
+        self._check_writable()
         self._check_not_latched()
         arr = np.asarray(q, dtype=np.float64)
         if arr.shape != (self.dof,):
@@ -720,11 +890,13 @@ class XArmDriver(ArmInterface):
             self._rail.set_target(float(arr[7]))
 
     def command_gripper(self, cmd: GripperCommand) -> None:
+        self._check_writable()
         self._check_not_latched()
         with self._gripper_cmd_lock:
             self._gripper_cmd = cmd  # latest-wins; drained by the monitor thread
 
     def command_rail(self, pos_m: float) -> None:
+        self._check_writable()
         if not self._has_rail or self._rail is None:
             raise RailUnavailableError(f"{self.cfg.arm_id} has no rail")
         self._check_not_latched()
@@ -767,6 +939,7 @@ class XArmDriver(ArmInterface):
         ``CommandError`` when not connected and ``RailUnavailableError`` without
         a track. Re-homing a homed track is allowed.
         """
+        self._check_writable()
         if self._api is None or self._streamer is None or self._monitor is None:
             raise CommandError(f"{self.cfg.arm_id}: driver not connected")
         if not self._has_rail or self._rail is None:
@@ -971,7 +1144,10 @@ class XArmDriver(ArmInterface):
     def stop(self) -> None:
         """Software stop: set_state(4) + LATCHED. Does NOT clear errors and is
         NOT a hardware STO — the physical e-stop button is the real emergency
-        path. Safe to call twice."""
+        path. Safe to call twice. On a read-only connection (phase-12) it is a
+        no-op: nothing of ours is moving and ``set_state(4)`` is a write."""
+        if self._readonly:
+            return
         if self._streamer is not None:
             self._streamer.pause()
         if self._api is not None:
@@ -1002,6 +1178,7 @@ class XArmDriver(ArmInterface):
         :meth:`drain_events` and as :meth:`recovery_result`. Works from any
         connected phase (LATCHED / FAULT / STREAMING); never runs SDK calls on the
         caller's thread. Raises ``CommandError`` when the driver is not connected."""
+        self._check_writable()
         if self._api is None or self._monitor is None:
             raise CommandError(f"{self.cfg.arm_id}: driver not connected")
         with self._phase_lock:
@@ -1036,9 +1213,26 @@ class XArmDriver(ArmInterface):
         ``set_state(4)`` -> ``motion_enable(False)``. The linear track is left
         alone — it keeps its homed flag (no ``set_linear_track_enable(False)``),
         so the next session needs no re-homing.
+
+        A read-only connection (phase-12) only stops its poll thread and calls
+        ``api.disconnect()``: the D6 hand-back writes (``set_mode`` /
+        ``set_state`` / ``motion_enable``) belong to a driving session and are
+        wrong for a client that never enabled the arm.
         """
         api, self._api = self._api, None
         if api is None:
+            return
+        if self._readonly:
+            for closer in (
+                lambda: self._poller.stop() if self._poller else None,
+                lambda: api.disconnect(),
+            ):
+                try:
+                    closer()
+                except Exception:  # noqa: BLE001 — disconnect never raises
+                    pass
+            self._poller = None
+            self._phase = DriverPhase.IDLE
             return
         for closer in (
             lambda: self._streamer.stop() if self._streamer else None,
@@ -1054,6 +1248,79 @@ class XArmDriver(ArmInterface):
             except Exception:  # noqa: BLE001 — disconnect never raises
                 pass
         self._phase = DriverPhase.IDLE
+
+
+class _ReadonlyPoller:
+    """Read-only poll thread of ``connect(readonly=True)`` (phase-12) at
+    ``cfg.monitor_rate_hz``: ``get_err_warn_code`` (the 30003 stream carries no
+    codes), the linear-track registers and the gripper opening — three reads,
+    zero writes. Deliberately NOT ``_MonitorThread``: that one recovers faults
+    (``clean_error`` / ``motion_enable`` / ``set_mode`` ...), steps the rail and
+    drains the gripper queue. A failed poll (SDK exception, or ``connected``
+    dropping) only marks the published state stale until the next successful
+    poll; nothing is ever retried with a write."""
+
+    def __init__(self, driver: XArmDriver) -> None:
+        self._d = driver
+        self._running = False
+        self._thread: threading.Thread | None = None
+        self._period = 1.0 / driver.cfg.monitor_rate_hz
+
+    def start(self) -> None:
+        if self._running:
+            return
+        self._running = True
+        self._thread = threading.Thread(
+            target=self._run, name=f"hw.{self._d.cfg.arm_id}.readonly", daemon=True
+        )
+        self._thread.start()
+
+    def stop(self) -> None:
+        self._running = False
+        if self._thread is not None:
+            self._thread.join(timeout=0.5)
+            self._thread = None
+
+    @property
+    def alive(self) -> bool:
+        return self._thread is not None and self._thread.is_alive()
+
+    def _run(self) -> None:
+        while self._running:
+            try:
+                self.step()
+            except Exception:  # noqa: BLE001 — a read-only poll never writes back
+                self._d._readonly_poll_ok = False
+            self._d._sleep(self._period)
+
+    def step(self) -> None:
+        d = self._d
+        api = d._api
+        if api is None:
+            return
+        if getattr(api, "connected", True) is False:
+            d._readonly_poll_ok = False
+            self._stale_edge()
+            return
+        d._read_err_warn_readonly()
+        d._read_rail_readonly()
+        d._read_gripper_readonly()
+        d._readonly_poll_ok = True
+        self._stale_edge()
+
+    def _stale_edge(self) -> None:
+        """StaleEvent on transitions, like the monitor's step 4 (get_state computes
+        the flag itself; a failed poll counts as stale)."""
+        d = self._d
+        now = d._clock()
+        snap = d._snap
+        stale = (
+            snap is None or (now - snap.mono_ts) > d.cfg.stale_after_s or not d._readonly_poll_ok
+        )
+        if stale != d._was_stale:
+            age = (now - snap.mono_ts) if snap is not None else float("inf")
+            d._emit(StaleEvent(d.cfg.arm_id, stale=stale, age_s=age, t_mono=now))
+            d._was_stale = stale
 
 
 class _MonitorThread:

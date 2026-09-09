@@ -3,6 +3,16 @@
 pyrealsense2 is an OPTIONAL extra (``pip install apollo-mavis-v2-hardware[realsense]``);
 this module imports without it and raises CameraInitError on use. Tests inject
 a fake ``rs`` module via ``rs_mod``.
+
+Depth (phase-12; 14-dora §4.2 "Depth"): with ``CameraConfig.depth`` the z16
+depth stream is enabled at the colour resolution / fps and published as
+``CameraFrame.depth`` ((H, W) uint16 in units of ``CameraFrame.depth_scale_m``,
+read ONCE from the depth sensor after the pipeline starts; 0.001 = mm when the
+SDK does not answer). With ``align_depth_to_color`` (default) the capture
+thread runs ``rs.align(rs.stream.color)`` on every frameset (~2 ms/frame budget
+on the lab machine) so depth pixels index the colour image. ``depth: false``
+(the default) leaves the colour-only behaviour untouched: no depth stream, no
+align object, ``depth is None``.
 """
 
 from __future__ import annotations
@@ -23,6 +33,7 @@ except ImportError:  # pragma: no cover - exercised via rs_mod injection
 
 WARMUP_S = 1.0  # sensor needs >= 1 s before frames are usable (LeRobot)
 STALE_AFTER_S = 0.5
+DEFAULT_DEPTH_SCALE_M = 0.001  # z16 in mm — the D4xx default, used when the SDK read fails
 
 
 class RealSenseCamera(CameraInterface):
@@ -43,6 +54,8 @@ class RealSenseCamera(CameraInterface):
         self._frame: CameraFrame | None = None
         self._seq = 0
         self._failed = False
+        self._align: Any = None  # rs.align(rs.stream.color), created once per start()
+        self._depth_scale_m = DEFAULT_DEPTH_SCALE_M
 
     @property
     def camera_id(self) -> str:
@@ -59,6 +72,12 @@ class RealSenseCamera(CameraInterface):
     @property
     def failed(self) -> bool:
         return self._failed
+
+    @property
+    def depth_scale_m(self) -> float:
+        """Metres per depth unit (read once after the pipeline starts; 0.001 when
+        depth is off or the sensor did not answer)."""
+        return self._depth_scale_m
 
     def start(self) -> None:
         if self._running:
@@ -80,6 +99,12 @@ class RealSenseCamera(CameraInterface):
                 raise CameraInitError(
                     "camera", f"{self.cfg.id}: pipeline start failed twice: {exc}"
                 ) from exc
+        if self.cfg.depth:
+            self._depth_scale_m = self._read_depth_scale()
+            self._align = rs.align(rs.stream.color) if self.cfg.align_depth_to_color else None
+        else:
+            self._depth_scale_m = DEFAULT_DEPTH_SCALE_M
+            self._align = None
         if self._warmup_s > 0:
             time.sleep(self._warmup_s)
         self._failed = False
@@ -95,9 +120,23 @@ class RealSenseCamera(CameraInterface):
         config.enable_device(str(self.cfg.serial))
         w, h = self.cfg.resolution
         config.enable_stream(rs.stream.color, w, h, rs.format.rgb8, self.cfg.fps)
+        if self.cfg.depth:
+            config.enable_stream(rs.stream.depth, w, h, rs.format.z16, self.cfg.fps)
         pipeline = rs.pipeline()
         pipeline.start(config)
         return pipeline
+
+    def _read_depth_scale(self) -> float:
+        """``first_depth_sensor().get_depth_scale()`` of the active device, once;
+        ``DEFAULT_DEPTH_SCALE_M`` when anything in that chain raises."""
+        try:
+            profile = self._pipeline.get_active_profile()
+            scale = float(profile.get_device().first_depth_sensor().get_depth_scale())
+        except Exception:  # noqa: BLE001 — optional metadata, never fatal
+            return DEFAULT_DEPTH_SCALE_M
+        if not np.isfinite(scale) or scale <= 0.0:
+            return DEFAULT_DEPTH_SCALE_M
+        return scale
 
     def _hardware_reset(self) -> None:
         rs = self._rs
@@ -122,6 +161,7 @@ class RealSenseCamera(CameraInterface):
             except Exception:  # noqa: BLE001
                 pass
             self._pipeline = None
+        self._align = None
 
     def latest(self) -> CameraFrame | None:
         with self._lock:
@@ -132,12 +172,23 @@ class RealSenseCamera(CameraInterface):
 
     def _capture_loop(self) -> None:
         while self._running:
+            depth_img: np.ndarray | None = None
             try:
                 frames = self._pipeline.wait_for_frames(timeout_ms=1000)
+                if self._align is not None:
+                    frames = self._align.process(frames)  # depth pixels -> colour pixels
                 color = frames.get_color_frame()
                 if not color:
                     continue
-                rgb = np.asanyarray(color.get_data())  # already RGB (rs.format.rgb8)
+                rgb = np.ascontiguousarray(np.asanyarray(color.get_data()))  # RGB (rs.format.rgb8)
+                if self.cfg.depth:
+                    depth = frames.get_depth_frame()
+                    if depth:  # a frameset without depth keeps the colour frame
+                        depth_img = np.ascontiguousarray(
+                            np.asanyarray(depth.get_data()), dtype=np.uint16
+                        )
+                        if depth_img.shape != rgb.shape[:2]:
+                            depth_img = None  # never publish depth that does not index rgb
             except Exception:  # noqa: BLE001
                 self._failed = True
                 self._running = False
@@ -145,10 +196,12 @@ class RealSenseCamera(CameraInterface):
             self._seq += 1
             frame = CameraFrame(
                 camera_id=self.cfg.id,
-                rgb=np.ascontiguousarray(rgb),
+                rgb=rgb,
                 t_mono=time.monotonic(),
                 wallclock_ns=time.time_ns(),
                 seq=self._seq,
+                depth=depth_img,
+                depth_scale_m=self._depth_scale_m,
             )
             with self._lock:
                 self._frame = frame

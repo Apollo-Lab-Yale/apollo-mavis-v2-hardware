@@ -44,6 +44,7 @@ from __future__ import annotations
 
 import threading
 import time
+from collections.abc import Mapping
 from dataclasses import dataclass
 from enum import Enum
 from typing import Any
@@ -147,6 +148,9 @@ class RailController:
         self._cleaned_once = False
         self._events: list[tuple[str, int, str]] = []  # (phase, code, detail)
         self.warnings: list[str] = []  # non-fatal detect() notes -> driver.connect_warnings
+        # the register dict the last successful detect() read (phase-12: lets the
+        # read-only connect seed pos_m / pos_known without a second round-trip)
+        self.last_registers: dict[str, Any] | None = None
 
     # -- properties ---------------------------------------------------------
     @property
@@ -199,6 +203,7 @@ class RailController:
         if code != 0 or not isinstance(registers, dict) or "pos" not in registers:
             self._phase = RailPhase.ABSENT
             return False
+        self.last_registers = dict(registers)
         read_sn = getattr(self._api, "get_linear_track_sn", None)
         if callable(read_sn):
             sn_code, sn = read_sn()
@@ -278,6 +283,35 @@ class RailController:
         self._pos_m = units.rail_mm_to_m(float(registers.get("pos", 0) or 0))
         self._setup_homed_track(who)
         self._event(self._phase, 0, f"rail ready at {self._pos_m:.3f} m")
+
+    def observe_registers(self, registers: Mapping[str, Any] | None) -> None:
+        """Read-only bookkeeping from one ``get_linear_track_registers`` reply
+        (phase-12, ``XArmDriver.connect(readonly=True)``): NEVER writes and never
+        changes the phase — the track stays ``DETECTED`` (a read-only client
+        never enables, homes or commands it, and ``set_target`` keeps dropping).
+
+        ``pos_known`` becomes True iff ``on_zero == 1 and is_enabled == 1`` (the
+        same rule as the connect gate and the read-only monitor: ``pos`` is a
+        measurement only on a homed AND enabled track) and ``pos_m`` is then the
+        register; otherwise — unhomed, disabled, or ``registers`` None / not a
+        register dict (a failed read) — the position is UNKNOWN and ``pos_m``
+        reads the ``UNKNOWN_RAIL_POS_M`` placeholder (0.0), exactly like the
+        phase-09d ``allow_unhomed`` case. Called on the driver's read-only poll
+        thread; a track homed by the operator meanwhile (the monitor's
+        ``home_rail`` op) is picked up on the next poll.
+        """
+        if not isinstance(registers, Mapping) or "pos" not in registers:
+            self._pos_m = UNKNOWN_RAIL_POS_M
+            self._pos_known = False
+            return
+        homed = int(registers.get("on_zero", 0) or 0) == 1
+        enabled = int(registers.get("is_enabled", 0) or 0) == 1
+        if homed and enabled:
+            self._pos_m = units.rail_mm_to_m(float(registers.get("pos", 0) or 0))
+            self._pos_known = True
+        else:
+            self._pos_m = UNKNOWN_RAIL_POS_M
+            self._pos_known = False
 
     def _setup_homed_track(self, who: str) -> None:
         """Enable + positioning speed (non-motion) on a HOMED track, then refresh

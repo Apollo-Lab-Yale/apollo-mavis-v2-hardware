@@ -181,16 +181,165 @@ class _FakeRsContext:
         return self._devices
 
 
+class _FakeRsFrame:
+    """One rs.frame: ``get_data()`` -> array; falsy when absent (rs frames are)."""
+
+    def __init__(self, data):
+        self._data = data
+
+    def get_data(self):
+        return self._data
+
+    def __bool__(self):
+        return True
+
+
+class _FakeRsFrameset:
+    RAW_DEPTH = 1234  # value the sensor's own depth frame carries
+    ALIGNED_DEPTH = 4321  # value after rs.align(rs.stream.color)
+
+    def __init__(self, w, h, *, depth, aligned=False, seq=0):
+        self.w, self.h, self.depth, self.aligned, self.seq = w, h, depth, aligned, seq
+
+    def get_color_frame(self):
+        rgb = np.full((self.h, self.w, 3), 7, dtype=np.uint8)
+        rgb[0, 0] = (1, 2, 3)
+        return _FakeRsFrame(rgb)
+
+    def get_depth_frame(self):
+        if not self.depth:
+            return None  # a frameset without a depth frame
+        value = self.ALIGNED_DEPTH if self.aligned else self.RAW_DEPTH
+        return _FakeRsFrame(np.full((self.h, self.w), value, dtype=np.uint16))
+
+
+class _FakeRsConfig:
+    def __init__(self):
+        self.device = None
+        self.streams: list[tuple] = []  # (stream, w, h, format, fps)
+
+    def enable_device(self, serial):
+        self.device = serial
+
+    def enable_stream(self, stream, w, h, fmt, fps):
+        self.streams.append((stream, w, h, fmt, fps))
+
+
+class _FakeRsSensor:
+    def __init__(self, module):
+        self._m = module
+
+    def get_depth_scale(self):
+        self._m.depth_scale_reads += 1
+        if self._m.depth_scale_raises:
+            raise RuntimeError("no depth sensor")
+        return self._m.depth_scale
+
+
+class _FakeRsDeviceHandle:
+    def __init__(self, module):
+        self._m = module
+
+    def first_depth_sensor(self):
+        return _FakeRsSensor(self._m)
+
+
+class _FakeRsProfile:
+    def __init__(self, module):
+        self._m = module
+
+    def get_device(self):
+        return _FakeRsDeviceHandle(self._m)
+
+
+class _FakeRsPipeline:
+    def __init__(self, module):
+        self._m = module
+        self.config = None
+        self.started = False
+        self.stopped = False
+        self._seq = 0
+
+    def start(self, config):
+        self.config = config
+        self.started = True
+        self._m.pipelines.append(self)
+
+    def stop(self):
+        self.stopped = True
+
+    def get_active_profile(self):
+        return _FakeRsProfile(self._m)
+
+    @property
+    def depth_enabled(self):
+        return any(st[0] == self._m.stream.depth for st in self.config.streams)
+
+    def wait_for_frames(self, timeout_ms=1000):
+        self._seq += 1
+        st = self.config.streams[0]
+        w, h = st[1], st[2]
+        depth = self.depth_enabled and not (
+            self._m.depth_frame_missing_every and self._seq % self._m.depth_frame_missing_every == 0
+        )
+        time.sleep(0.002)
+        return _FakeRsFrameset(w, h, depth=depth, seq=self._seq)
+
+
+class _FakeRsAlign:
+    def __init__(self, module, stream):
+        self.stream = stream
+        self.processed = 0
+        module.aligns.append(self)
+
+    def process(self, frames):
+        self.processed += 1
+        return _FakeRsFrameset(frames.w, frames.h, depth=frames.depth, aligned=True, seq=frames.seq)
+
+
 class FakeRsModule:
+    """Enough of ``pyrealsense2`` for RealSenseCamera: context/devices, config,
+    pipeline (framesets with colour + optional z16 depth), align, depth scale."""
+
     class camera_info:
         serial_number = "serial_number"
         name = "name"
 
-    def __init__(self, serials):
+    class stream:
+        color = "stream.color"
+        depth = "stream.depth"
+
+    class format:
+        rgb8 = "format.rgb8"
+        z16 = "format.z16"
+
+    def __init__(
+        self,
+        serials,
+        *,
+        depth_scale=0.001,
+        depth_scale_raises=False,
+        depth_frame_missing_every=0,
+    ):
         self._devices = [_FakeRsDevice(s, f"Intel RealSense D435 ({s})") for s in serials]
+        self.depth_scale = depth_scale
+        self.depth_scale_raises = depth_scale_raises
+        self.depth_scale_reads = 0
+        self.depth_frame_missing_every = depth_frame_missing_every  # 0 = never missing
+        self.pipelines: list[_FakeRsPipeline] = []
+        self.aligns: list[_FakeRsAlign] = []
 
     def context(self):
         return _FakeRsContext(self._devices)
+
+    def config(self):
+        return _FakeRsConfig()
+
+    def pipeline(self):
+        return _FakeRsPipeline(self)
+
+    def align(self, stream):
+        return _FakeRsAlign(self, stream)
 
 
 def test_find_all_cameras_dedups_realsense_v4l2_ghosts():
@@ -212,7 +361,10 @@ def test_find_all_cameras_dedups_realsense_v4l2_ghosts():
     assert "Logitech" in merged[1]["device_path"]
 
 
-def test_realsense_requires_module_and_serial():
+def test_realsense_requires_module_and_serial(monkeypatch):
+    from apollo_mavis_v2_hardware.cameras import realsense_camera as rs_module
+
+    monkeypatch.setattr(rs_module, "_rs", None)  # "pyrealsense2 not installed" regardless of venv
     cfg = CameraConfig(id="rs0", kind="realsense", serial="823112061234")
     cam = RealSenseCamera(cfg, rs_mod=None, warmup_s=0.0)
     with pytest.raises(CameraInitError, match="pyrealsense2"):
@@ -226,6 +378,112 @@ def test_make_camera_dispatch():
     assert isinstance(cam, OpenCVCamera)
     with pytest.raises(CameraInitError):
         make_camera(CameraConfig(id="s", kind="sim"))
+
+
+# -- RealSense depth (phase-12; 14-dora §4.2 "Depth") ------------------------------------------
+RS_SERIAL = "823112061234"
+
+
+def _rs_cfg(**kw) -> CameraConfig:
+    base: dict = {"id": "view_wrist", "kind": "realsense", "serial": RS_SERIAL}
+    base["resolution"] = (6, 4)
+    base["fps"] = 30
+    base.update(kw)
+    return CameraConfig(**base)
+
+
+def _first_frame(cam, timeout=2.0):
+    deadline = time.monotonic() + timeout
+    frame = None
+    while frame is None and time.monotonic() < deadline:
+        frame = cam.latest()
+        time.sleep(0.005)
+    assert frame is not None, "no frame"
+    return frame
+
+
+def test_realsense_depth_off_is_colour_only():
+    rs = FakeRsModule([RS_SERIAL])
+    cam = RealSenseCamera(_rs_cfg(), rs_mod=rs, warmup_s=0.0)
+    cam.start()
+    try:
+        frame = _first_frame(cam)
+        pipe = rs.pipelines[0]
+        assert pipe.config.device == RS_SERIAL
+        assert pipe.config.streams == [(rs.stream.color, 6, 4, rs.format.rgb8, 30)]  # no depth
+        assert rs.aligns == []  # no align object
+        assert rs.depth_scale_reads == 0  # sensor never queried
+        assert frame.depth is None and frame.depth_scale_m == 0.001
+        assert cam.depth_scale_m == 0.001
+        assert frame.rgb.shape == (4, 6, 3) and frame.rgb[0, 0].tolist() == [1, 2, 3]
+    finally:
+        cam.stop()
+
+
+def test_realsense_depth_on_with_align():
+    rs = FakeRsModule([RS_SERIAL], depth_scale=0.00025)
+    cam = RealSenseCamera(_rs_cfg(depth=True), rs_mod=rs, warmup_s=0.0)  # align default True
+    cam.start()
+    try:
+        frame = _first_frame(cam)
+        pipe = rs.pipelines[0]
+        assert pipe.config.streams == [
+            (rs.stream.color, 6, 4, rs.format.rgb8, 30),
+            (rs.stream.depth, 6, 4, rs.format.z16, 30),  # same w, h, fps as colour
+        ]
+        assert len(rs.aligns) == 1 and rs.aligns[0].stream == rs.stream.color  # created once
+        assert rs.aligns[0].processed >= 1
+        assert frame.depth is not None
+        assert frame.depth.shape == (4, 6) and frame.depth.dtype == np.uint16
+        assert int(frame.depth[0, 0]) == _FakeRsFrameset.ALIGNED_DEPTH  # aligned, not raw
+        assert frame.depth_scale_m == pytest.approx(0.00025)  # the sensor's scale, read once
+        assert rs.depth_scale_reads == 1 and cam.depth_scale_m == pytest.approx(0.00025)
+        assert frame.rgb.shape == (4, 6, 3)
+        time.sleep(0.05)
+        assert rs.depth_scale_reads == 1  # not re-read per frame
+    finally:
+        cam.stop()
+    assert rs.pipelines[0].stopped
+
+
+def test_realsense_depth_on_without_align():
+    rs = FakeRsModule([RS_SERIAL], depth_scale=0.001)
+    cam = RealSenseCamera(_rs_cfg(depth=True, align_depth_to_color=False), rs_mod=rs, warmup_s=0.0)
+    cam.start()
+    try:
+        frame = _first_frame(cam)
+        assert any(st[0] == rs.stream.depth for st in rs.pipelines[0].config.streams)
+        assert rs.aligns == []  # no align object when align is off
+        assert frame.depth is not None
+        assert frame.depth.shape == (4, 6) and frame.depth.dtype == np.uint16
+        assert int(frame.depth[0, 0]) == _FakeRsFrameset.RAW_DEPTH  # the sensor's own frame
+        assert frame.depth_scale_m == pytest.approx(0.001)
+    finally:
+        cam.stop()
+
+
+def test_realsense_missing_depth_frame_keeps_the_colour_frame():
+    rs = FakeRsModule([RS_SERIAL], depth_frame_missing_every=1)  # never a depth frame
+    cam = RealSenseCamera(_rs_cfg(depth=True), rs_mod=rs, warmup_s=0.0)
+    cam.start()
+    try:
+        frame = _first_frame(cam)
+        assert frame.depth is None and frame.rgb.shape == (4, 6, 3)
+        assert not cam.failed
+    finally:
+        cam.stop()
+
+
+def test_realsense_depth_scale_read_failure_falls_back_to_mm():
+    rs = FakeRsModule([RS_SERIAL], depth_scale_raises=True)
+    cam = RealSenseCamera(_rs_cfg(depth=True), rs_mod=rs, warmup_s=0.0)
+    cam.start()
+    try:
+        frame = _first_frame(cam)
+        assert frame.depth is not None and frame.depth_scale_m == 0.001
+        assert rs.depth_scale_reads == 1
+    finally:
+        cam.stop()
 
 
 # -- USB-serial addressing (RealSense D435i colour over UVC) -----------------------------------

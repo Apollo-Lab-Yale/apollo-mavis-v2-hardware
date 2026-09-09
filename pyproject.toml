@@ -53,6 +53,9 @@ select = ["E", "F", "I", "UP", "B", "TID251"]
 "mink".msg = "hardware must not import mink"
 "apollo_mavis_v2_sim".msg = "hardware depends only on core"
 "apollo_mavis_v2_runtime".msg = "hardware depends only on core"
+# phase-12: the dora external interface lives in the runtime's dora_bridge only
+"dora".msg = "hardware must not import dora"
+"pyarrow".msg = "hardware must not import pyarrow"
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

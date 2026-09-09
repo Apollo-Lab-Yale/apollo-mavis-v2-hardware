@@ -8,14 +8,24 @@ V4L2/RealSense camera backends and a read-only controller state monitor
 The driver never homes the rail at connect (``RailNotHomedError`` by default,
 phase-09c); phase-09d adds ``XArmDriver.home_rail()`` for the runtime's
 operator-confirmed, twin-planned rail-homing maintenance motion on a driver
-connected with ``rail_homing: "allow_unhomed"``. Depends only on
+connected with ``rail_homing: "allow_unhomed"``. Phase-12 adds
+``XArmDriver.connect(readonly=True)`` (state-only connection for the runtime's
+idle arm reader; ``READONLY_ALLOWED_SDK_METHODS`` is its complete SDK surface)
+and depth on ``RealSenseCamera`` (``CameraConfig.depth``). Depends only on
 apollo-mavis-v2-core.
 """
 
 from . import units
 from .backstops import BACKSTOP_SDK_METHODS, apply_backstops, expected_backstop_sequence
 from .config import ServoLimits, XArmDriverConfig
-from .driver import ArmFaultedError, DriverPhase, RecoveryResult, XArmDriver
+from .driver import (
+    READONLY_ALLOWED_SDK_ATTRS,
+    READONLY_ALLOWED_SDK_METHODS,
+    ArmFaultedError,
+    DriverPhase,
+    RecoveryResult,
+    XArmDriver,
+)
 from .events import (
     DriverEvent,
     FaultEvent,
@@ -66,6 +76,8 @@ __all__ = [
     "DriverPhase",
     "ArmFaultedError",
     "RecoveryResult",
+    "READONLY_ALLOWED_SDK_METHODS",  # connect(readonly=True) call surface (phase-12)
+    "READONLY_ALLOWED_SDK_ATTRS",
     "apply_backstops",
     "expected_backstop_sequence",
     "BACKSTOP_SDK_METHODS",
