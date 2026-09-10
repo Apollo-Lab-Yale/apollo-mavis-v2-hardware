@@ -6,10 +6,17 @@ import time
 import numpy as np
 import pytest
 from apollo_mavis_v2_core import CommandError
-from fakes.fake_xarm_api import FaultScript
+from fakes.fake_xarm_api import FakeXArmAPI, FaultScript
 from test_driver_connect import make_driver, wait_until
 
-from apollo_mavis_v2_hardware.driver import ArmFaultedError, DriverPhase, RecoveryResult
+from apollo_mavis_v2_hardware.config import XArmDriverConfig
+from apollo_mavis_v2_hardware.driver import (
+    REFAULT_WINDOW_S,
+    ArmFaultedError,
+    DriverPhase,
+    RecoveryResult,
+    XArmDriver,
+)
 from apollo_mavis_v2_hardware.events import (
     FaultEvent,
     RecoveredEvent,
@@ -108,16 +115,174 @@ def test_second_c24_inside_backoff_window_latches() -> None:
 
 def test_fourth_recoverable_error_in_30s_latches() -> None:
     drv, h = make_driver()
+    api = h["api"]
     try:
         for n in range(1, 4):  # three recoveries fit the budget
-            h["api"].inject_error(22)  # self-collision: RECOVERABLE
+            # a FRESH fault: the runtime asked for motion since the last reseed (the
+            # same code re-firing with the arm holding still is the re-fault-under-load
+            # case below, which latches at once instead of spending the budget)
+            wait_until(lambda: len(api.sent_joints) > 0)
+            drv.command_joints(np.asarray(api.sent_joints[-1][1]) + 0.05)
+            wait_until(lambda: drv._streamer.moved_since_reseed)
+            api.inject_error(22)  # self-collision: RECOVERABLE
             collect_until(
                 drv,
                 lambda evs, n=n: sum(isinstance(e, RecoveredEvent) for e in evs) >= 1,
             )
             wait_until(lambda: drv.phase is DriverPhase.STREAMING)
-        h["api"].inject_error(22)  # 4th within the rolling 30 s window
+        drv.command_joints(np.asarray(api.sent_joints[-1][1]) + 0.05)
+        wait_until(lambda: drv._streamer.moved_since_reseed)
+        api.inject_error(22)  # 4th within the rolling 30 s window
         wait_until(lambda: drv.phase is DriverPhase.LATCHED, msg="budget never latched")
+        assert "recovery budget exhausted" in drv._latch_reason
+    finally:
+        drv.disconnect()
+
+
+# -- re-fault under load (2026-09-09 fridge-door session) -----------------------------
+# Every auto-recovery from C31 re-enabled the servos with the door still pulling on the
+# gripper; holding the re-seeded posture under that load re-faulted ~200 ms later, four
+# C31 in 660 ms with the arm standing still, and "recovery budget exhausted (3 in 30 s)"
+# latched before the operator could do anything. A same-code re-fault inside
+# REFAULT_WINDOW_S with no new target now latches at once with a hint and leaves the
+# budget alone; a re-fault after a new target is a fresh event on the budget path.
+
+
+class _LoadedArmAPI(FakeXArmAPI):
+    """While ``load`` is on, the arm re-faults with C31 on the Nth accepted servo tick
+    after every clean_error — an external force the controller reads as a collision
+    as soon as the servos hold position again."""
+
+    def __init__(self, *args, refault_after_ticks: int = 3, **kwargs) -> None:
+        super().__init__(*args, **kwargs)
+        self.load = False
+        self.refault_after_ticks = refault_after_ticks
+        self._ok_since_clean = 0
+
+    def clean_error(self) -> int:
+        self._ok_since_clean = 0
+        return super().clean_error()
+
+    def set_servo_angle_j(self, angles, *args, **kwargs) -> int:
+        code = super().set_servo_angle_j(angles, *args, **kwargs)
+        if code == 0 and self.load:
+            self._ok_since_clean += 1
+            if self._ok_since_clean >= self.refault_after_ticks:
+                self.inject_error(31)
+                return 1
+        return code
+
+
+def _make_loaded_driver():
+    holder = {}
+
+    def factory(ip, **kw):
+        api = _LoadedArmAPI(ip, auto_report_hz=200.0)
+        holder["api"] = api
+        return api
+
+    cfg = XArmDriverConfig(arm_id="a1", ip="192.168.1.235", monitor_rate_hz=100.0)
+    drv = XArmDriver(cfg, api_factory=factory)
+    drv.connect()
+    return drv, holder["api"]
+
+
+def test_c31_refault_while_holding_latches_with_the_contact_hint() -> None:
+    drv, api = _make_loaded_driver()
+    try:
+        wait_until(lambda: len(api.sent_joints) > 3)
+        drv.drain_events()
+        n_enable_before = api.call_names().count("motion_enable")
+        api.load = True
+        api.inject_error(31)  # the door's pull trips the collision detector
+        wait_until(lambda: drv.phase is DriverPhase.LATCHED, msg="never latched")
+        # exactly ONE automatic recovery ran (clean/enable/mode/state once), the arm
+        # re-faulted while only re-sending the re-seeded posture, and the driver did
+        # not re-enable a second time
+        assert api.call_names().count("motion_enable") == n_enable_before + 1
+        assert len(drv._recovery_times) == 1  # the burst cost one budget slot, not three
+        assert "recovery budget exhausted" not in drv._latch_reason
+        assert "holding still" in drv._latch_reason
+        assert "load is still on the arm" in drv._latch_reason
+        assert drv._latch_reason.endswith("then Recover")
+        events = drv.drain_events()
+        kinds = [type(e).__name__ for e in events]
+        assert kinds.count("RecoveredEvent") == 1
+        latch = [e for e in events if isinstance(e, FaultEvent) and e.source == "latch"]
+        assert latch and latch[-1].error_code == 31
+        assert latch[-1].detail == drv._latch_reason
+        res = drv.recovery_result()
+        assert res is not None and not res.ok and res.error_code == 31
+        with pytest.raises(ArmFaultedError) as exc:
+            drv.command_joints(np.zeros(7))
+        assert "load is still on the arm" in str(exc.value)
+        # the operator lets go of the door and presses Recover: streaming again
+        api.load = False
+        drv.request_recovery()
+        wait_until(lambda: drv.phase is DriverPhase.STREAMING, msg="Recover did not resume")
+        assert drv._last_auto_recovery is None  # a user action forgets the burst
+        assert len(drv._recovery_times) == 0
+    finally:
+        drv.disconnect()
+
+
+def test_c31_refault_after_a_new_target_is_a_fresh_event_on_the_budget() -> None:
+    """The operator pulled again after the recovery: the second C31 is a new collision,
+    not a load that never went away — it recovers normally and costs a budget slot."""
+    drv, api = _make_loaded_driver()
+    try:
+        wait_until(lambda: len(api.sent_joints) > 3)
+        drv.drain_events()
+        api.inject_error(31)
+        collect_until(drv, lambda evs: any(isinstance(e, RecoveredEvent) for e in evs))
+        wait_until(lambda: drv.phase is DriverPhase.STREAMING)
+        held = np.asarray(api.sent_joints[-1][1])
+        drv.command_joints(held + 0.05)  # a new target: motion was asked for
+        wait_until(lambda: drv._streamer.moved_since_reseed)
+        api.inject_error(31)
+        collect_until(drv, lambda evs: sum(isinstance(e, RecoveredEvent) for e in evs) >= 1)
+        wait_until(lambda: drv.phase is DriverPhase.STREAMING)
+        assert len(drv._recovery_times) == 2
+    finally:
+        drv.disconnect()
+
+
+def test_refault_outside_the_window_is_a_fresh_event() -> None:
+    """Same code, arm still, but well after REFAULT_WINDOW_S: the load that was there
+    has had time to go — treat it as a new fault on the budget path."""
+    drv, h = make_driver()
+    api = h["api"]
+    try:
+        wait_until(lambda: len(api.sent_joints) > 3)
+        api.inject_error(31)
+        collect_until(drv, lambda evs: any(isinstance(e, RecoveredEvent) for e in evs))
+        wait_until(lambda: drv.phase is DriverPhase.STREAMING)
+        t_rec, err = drv._last_auto_recovery
+        assert err == 31
+        drv._last_auto_recovery = (t_rec - REFAULT_WINDOW_S - 0.1, err)  # fast-forward
+        drv.drain_events()
+        api.inject_error(31)
+        collect_until(drv, lambda evs: any(isinstance(e, RecoveredEvent) for e in evs))
+        wait_until(lambda: drv.phase is DriverPhase.STREAMING)
+        assert len(drv._recovery_times) == 2
+    finally:
+        drv.disconnect()
+
+
+def test_hold_target_equal_to_the_reseed_does_not_count_as_motion() -> None:
+    """The runtime re-sends the re-anchored posture every tick after a recovery; a
+    target within REFAULT_STILL_TOL_RAD of the reseed is 'holding still'."""
+    drv, h = make_driver()
+    api = h["api"]
+    try:
+        wait_until(lambda: len(api.sent_joints) > 3)
+        api.inject_error(31)
+        events = collect_until(drv, lambda evs: any(isinstance(e, RecoveredEvent) for e in evs))
+        reseed = next(e for e in events if isinstance(e, ReseedEvent))
+        drv.command_joints(np.asarray(reseed.q) + 1e-4)  # IK round-off, not motion
+        assert not drv._streamer.moved_since_reseed
+        drv.command_joints(np.asarray(reseed.q) + 0.01)  # a real step
+        assert drv._streamer.moved_since_reseed
     finally:
         drv.disconnect()
 

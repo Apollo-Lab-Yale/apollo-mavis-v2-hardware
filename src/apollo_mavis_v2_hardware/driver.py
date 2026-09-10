@@ -87,6 +87,18 @@ UNRECOVERABLE_ERRORS = frozenset({1, 2, 3, 10, 11, 12, 13, 14, 15, 16, 17, 19, 2
 RAIL_COMMS_ERROR = 111  # latches only the rail; the arm keeps streaming
 RECOVERY_BUDGET = 3  # recoveries per rolling window, else LATCHED
 RECOVERY_WINDOW_S = 30.0
+# A RECOVERABLE error that fires AGAIN within this window of an automatic recovery,
+# with the same code, while the streamer has only re-sent the re-seeded posture (no
+# new target from the runtime) means the cause is still physically there — for C31
+# the collision load is still on the arm (the fridge door pulling on the gripper, a
+# hand leaning on a link). Re-enabling cannot clear it: on 2026-09-09 the lab arm
+# re-faulted 200 ms after every 20 ms auto-recovery, four C31 in 660 ms with the arm
+# standing still, and the budget was gone before the operator had a turn. Such a
+# re-fault LATCHES at once with a hint (back off / let go, then Recover) and does
+# not consume the budget; a re-fault AFTER a new target is a fresh event and takes
+# the normal budget path.
+REFAULT_WINDOW_S = 1.5
+REFAULT_STILL_TOL_RAD = 1e-3  # |target - reseed| below this per joint = "held still"
 C24_BACKOFF_S = 10.0  # halved vel/acc after a C24 recovery
 C24_ERROR = 24
 
@@ -164,6 +176,21 @@ def classify_error(err: int) -> FaultKind:
     return FaultKind.UNRECOVERABLE
 
 
+def _refault_reason(err: int, dt: float) -> str:
+    """Latch text for a RECOVERABLE error that re-fired ``dt`` s after an automatic
+    recovery while the arm only held its re-seeded posture (see REFAULT_WINDOW_S)."""
+    ms = int(round(dt * 1000.0))
+    if err == 31:
+        return (
+            f"re-latched {ms} ms after recovery with the arm holding still: the collision "
+            "load is still on the arm - back it off or let go of the object, then Recover"
+        )
+    return (
+        f"re-latched {ms} ms after recovery with the arm holding still: re-enabling "
+        "cannot clear it - remove the cause, then Recover"
+    )
+
+
 @dataclass(frozen=True)
 class _StateSnap:
     """Written only by the report callback; read by get_state() (ref swap)."""
@@ -226,6 +253,8 @@ class _ServoStreamer:
         self._target: np.ndarray | None = None  # latest-wins
         self._last_sent = np.zeros(7)
         self._prev_dq = np.zeros(7)
+        self._reseed_q: np.ndarray | None = None  # posture of the last reseed()
+        self._moved_since_reseed = False  # a target != reseed posture arrived
         self._scale = 1.0  # C24 backoff halves this for 10 s
         self._paused = True
         self._running = False
@@ -247,6 +276,12 @@ class _ServoStreamer:
     def set_target(self, q7: np.ndarray) -> None:
         with self._lock:
             self._target = np.array(q7, dtype=np.float64)
+            if (
+                not self._moved_since_reseed
+                and self._reseed_q is not None
+                and np.max(np.abs(self._target - self._reseed_q)) > REFAULT_STILL_TOL_RAD
+            ):
+                self._moved_since_reseed = True
 
     def reseed(self, q7: np.ndarray) -> None:
         """target := last_sent := q7, zero velocity (post-recovery re-anchor)."""
@@ -255,6 +290,8 @@ class _ServoStreamer:
             self._target = q.copy()
             self._last_sent = q.copy()
             self._prev_dq = np.zeros(7)
+            self._reseed_q = q.copy()
+            self._moved_since_reseed = False
 
     def pause(self) -> None:
         with self._lock:
@@ -293,6 +330,14 @@ class _ServoStreamer:
     @property
     def paused(self) -> bool:
         return self._paused
+
+    @property
+    def moved_since_reseed(self) -> bool:
+        """True once a target more than ``REFAULT_STILL_TOL_RAD`` away from the last
+        reseed posture arrived — i.e. the runtime asked for motion after the recovery.
+        False = the stream has only re-sent the held posture."""
+        with self._lock:
+            return self._moved_since_reseed
 
     @property
     def not_ready_ticks(self) -> int:
@@ -422,6 +467,7 @@ class XArmDriver(ArmInterface):
         self._events_lock = threading.Lock()
         self._recovery_lock = threading.Lock()
         self._recovery_times: deque[float] = deque()
+        self._last_auto_recovery: tuple[float, int] | None = None  # (t_mono, error code)
         self._c24_backoff_until: float | None = None
         self._fault_pending = False
         self._fault_code = 0
@@ -1018,9 +1064,15 @@ class XArmDriver(ArmInterface):
                     self._handle_external(resume_from_fault=True)
                     self._record_recovery(err, user_initiated)
                     return
-                if kind == FaultKind.RECOVERABLE and not self._budget_ok(now, err):
-                    self._record_recovery(err, user_initiated)
-                    return  # _budget_ok latched already
+                if kind == FaultKind.RECOVERABLE:
+                    refault_dt = self._refault_while_holding(now, err)
+                    if refault_dt is not None:
+                        self._latch(_refault_reason(err, refault_dt))
+                        self._record_recovery(err, user_initiated)
+                        return
+                    if not self._budget_ok(now, err):
+                        self._record_recovery(err, user_initiated)
+                        return  # _budget_ok latched already
             # steps 3-6: the binding recovery sequence
             api.clean_error()
             api.clean_warn()
@@ -1049,6 +1101,7 @@ class XArmDriver(ArmInterface):
                 self._c24_backoff_until = now + C24_BACKOFF_S
             if not user_initiated and kind == FaultKind.RECOVERABLE:
                 self._recovery_times.append(now)
+                self._last_auto_recovery = (now, err)
             self._err_code, self._warn_code = 0, warn
             self._phase = DriverPhase.STREAMING
             self._emit(RecoveredEvent(self.cfg.arm_id, err, t_mono=now))
@@ -1066,6 +1119,21 @@ class XArmDriver(ArmInterface):
             user_initiated=user_initiated,
             t_mono=self._clock(),
         )
+
+    def _refault_while_holding(self, now: float, err: int) -> float | None:
+        """Seconds since the last AUTO recovery when ``err`` is the same controller
+        error re-firing inside ``REFAULT_WINDOW_S`` while the streamer has only
+        re-sent the re-seeded posture; ``None`` otherwise (fresh event)."""
+        last = self._last_auto_recovery
+        if last is None:
+            return None
+        t_rec, last_err = last
+        dt = now - t_rec
+        if err != last_err or dt > REFAULT_WINDOW_S:
+            return None
+        if self._streamer is None or self._streamer.moved_since_reseed:
+            return None
+        return dt
 
     def _budget_ok(self, now: float, err: int) -> bool:
         """<= 3 recoveries per rolling 30 s; a second C24 inside the backoff
@@ -1187,6 +1255,7 @@ class XArmDriver(ArmInterface):
     def _reset_recovery_budget(self) -> None:
         """An explicit user action resets the auto-recovery budget and C24 backoff."""
         self._recovery_times.clear()
+        self._last_auto_recovery = None
         self._c24_backoff_until = None
         if self._streamer is not None:
             self._streamer.set_scale(1.0)
