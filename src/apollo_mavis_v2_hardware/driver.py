@@ -38,7 +38,7 @@ from apollo_mavis_v2_core import (
 )
 
 from . import units
-from .backstops import apply_backstops
+from .backstops import STATUS_ECHO_CODES, apply_backstops, set_collision_sensitivity
 from .config import ServoLimits, XArmDriverConfig
 from .events import (
     DriverEvent,
@@ -197,7 +197,8 @@ class _StateSnap:
 
     q: np.ndarray  # (7,) rad, actual_joint_angle
     dq: np.ndarray  # (7,) rad/s, finite-diff + EMA(alpha=0.5)
-    ee_pose_sdk: tuple[float, ...]  # actual_tcp_pose[6], mm + rad, base frame
+    ee_pose_sdk: tuple[float, ...]  # actual_tcp_pose[6] = the FLANGE (tcp_offset 0), mm +
+    #   rad (extrinsic-XYZ RPY), base frame; converted to the twin's link_tcp in get_state()
     tau: np.ndarray  # (7,) N*m
     mode: int
     state: int
@@ -217,6 +218,26 @@ class RecoveryResult:
     detail: str = ""  # latch reason when not ok
     user_initiated: bool = False
     t_mono: float = 0.0
+
+
+@dataclass(frozen=True)
+class SettingResult:
+    """Outcome of one operator-requested controller-setting write executed on the
+    monitor thread (``XArmDriver.request_set_collision_sensitivity`` ->
+    ``XArmDriver.setting_result()``), 2026-09-11. ``ok`` = the SDK accepted the
+    write: code 0, or one of ``backstops.STATUS_ECHO_CODES`` (1 / 2 / 9 - the RAW
+    reply of ``set_collision_sensitivity`` echoes a latched error / warning /
+    not-ready state although the value was written; ``detail`` says so). The
+    session driver's ``real`` 30003 stream carries no sensitivity read-back, so
+    this is what the runtime can report inside a session; the read-only monitor
+    verifies the value the next time it holds the box."""
+
+    seq: int  # increases with every completed write
+    ok: bool
+    code: int  # SDK return code of set_collision_sensitivity (-1: exception)
+    level: int  # the level written (1..3)
+    t_mono: float = 0.0
+    detail: str = ""  # echo / failure text; "" on a clean 0
 
 
 class _ServoStreamer:
@@ -475,6 +496,10 @@ class XArmDriver(ArmInterface):
         self._user_recovery_pending = False  # request_recovery() -> monitor thread
         self._recovery_seq = 0
         self._recovery_result: RecoveryResult | None = None
+        # request_set_collision_sensitivity() -> monitor thread (2026-09-11); latest wins
+        self._pending_sensitivity: int | None = None
+        self._setting_seq = 0
+        self._setting_result: SettingResult | None = None
         self._latch_reason = ""
         self._was_stale = True
         self._external_retry_at: float | None = None
@@ -557,6 +582,12 @@ class XArmDriver(ArmInterface):
         lets a waiter (REST) observe success/latch without draining the events
         the control loop consumes."""
         return self._recovery_result
+
+    def setting_result(self) -> SettingResult | None:
+        """Outcome of the most recent :meth:`request_set_collision_sensitivity`
+        write (None before the first); ``seq`` increases per write so a waiter
+        (the runtime's session path) can tell its own result from an older one."""
+        return self._setting_result
 
     def _emit(self, event: DriverEvent) -> None:
         with self._events_lock:
@@ -880,7 +911,8 @@ class XArmDriver(ArmInterface):
             stale = True
         else:
             q7, dq7 = snap.q, snap.dq
-            ee = units.sdk_to_pose(snap.ee_pose_sdk)
+            # the wire carries the flange; ArmState.ee_pose is the twin's link_tcp
+            ee = units.sdk_to_tcp_pose(snap.ee_pose_sdk, gripper=(self.cfg.gripper != "none"))
             mode, state = snap.mode, snap.state
             mono_ts, wall = snap.mono_ts, snap.wallclock_ns
             stale = (now - snap.mono_ts) > self.cfg.stale_after_s
@@ -1252,6 +1284,63 @@ class XArmDriver(ArmInterface):
         with self._phase_lock:
             self._user_recovery_pending = True
 
+    def request_set_collision_sensitivity(self, level: int) -> None:
+        """Operator-requested collision-sensitivity override inside a session
+        (2026-09-11): flag it; the 5 Hz monitor thread issues the ONE write
+        ``backstops.set_collision_sensitivity(api, level)`` and publishes a
+        :class:`SettingResult` (:meth:`setting_result`). Mirrors
+        :meth:`request_recovery`: never an SDK call on the caller's thread, one
+        ``XArmAPI`` stays single-threaded. ``level`` must be 1, 2 or 3
+        (``CommandError`` otherwise - 0 turns detection off, 4 / 5 false-trigger
+        under payload; the runtime validates at the wire first); ``CommandError``
+        too on a read-only or unconnected driver. No motion: the SDK call runs
+        ``wait_move()`` (immediate in servo mode 1) -> ``set_collis_sens`` ->
+        ``set_state(0)`` (idempotent for a streaming arm; refused by the controller
+        while an error is latched; on a user-stopped arm it re-arms the state
+        machine without a command, and the driver phase does not change). The
+        driver's own phase / budget / streamer are untouched. Volatile: the next
+        connect's ``apply_backstops`` restores ``cfg.collision_sensitivity``."""
+        self._check_writable()
+        if isinstance(level, bool) or int(level) != level or int(level) not in (1, 2, 3):
+            raise CommandError(
+                f"{self.cfg.arm_id}: collision sensitivity must be 1, 2 or 3 (got {level!r})"
+            )
+        if self._api is None or self._monitor is None:
+            raise CommandError(f"{self.cfg.arm_id}: driver not connected")
+        with self._phase_lock:
+            self._pending_sensitivity = int(level)
+
+    def _apply_collision_sensitivity(self, level: int) -> None:
+        """Monitor-thread half of :meth:`request_set_collision_sensitivity`: the one
+        SDK write, then the outcome as :meth:`setting_result`. Never raises."""
+        api = self._api
+        if api is None:
+            return
+        codes: dict[str, int] = {}
+        try:
+            warnings = set_collision_sensitivity(api, level, codes)
+            code = codes.get("set_collision_sensitivity", -1)
+            detail = "; ".join(warnings)
+        except Exception as exc:  # noqa: BLE001 — the SDK raises bare Exception
+            code = -1
+            detail = f"set_collision_sensitivity failed: {type(exc).__name__}: {exc}".rstrip(": ")
+        ok = code == 0 or code in STATUS_ECHO_CODES
+        if ok and code != 0:
+            detail = (
+                f"set_collision_sensitivity returned {code} (status echo: the controller has "
+                "an error / warning latched or is not ready; the write went through - the "
+                "read-only monitor verifies the value once it holds the box again)"
+            )
+        self._setting_seq += 1
+        self._setting_result = SettingResult(
+            seq=self._setting_seq,
+            ok=ok,
+            code=code,
+            level=int(level),
+            t_mono=self._clock(),
+            detail=detail,
+        )
+
     def _reset_recovery_budget(self) -> None:
         """An explicit user action resets the auto-recovery budget and C24 backoff."""
         self._recovery_times.clear()
@@ -1441,6 +1530,12 @@ class _MonitorThread:
         if d._fault_pending and d._phase == DriverPhase.FAULT:
             d._recover()
             return
+        # 0b. operator-requested collision-sensitivity write (2026-09-11): one SDK
+        #     call on this thread, outcome via setting_result(); the tick goes on
+        with d._phase_lock:
+            level, d._pending_sensitivity = d._pending_sensitivity, None
+        if level is not None:
+            d._apply_collision_sensitivity(level)
         # 1. link loss
         if getattr(api, "connected", True) is False:
             if d._phase != DriverPhase.LATCHED:

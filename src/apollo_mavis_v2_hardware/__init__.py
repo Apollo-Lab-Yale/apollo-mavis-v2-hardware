@@ -4,7 +4,10 @@ Implements core's ArmInterface/CameraInterface/WorkcellInterface over the
 xArm-Python-SDK (pinned 1.18.5), plus NetworkManager auto-matching (netsetup),
 V4L2/RealSense camera backends and a read-only controller state monitor
 (``ArmStateMonitor``, phase-09a) with an explicit operator maintenance channel
-(``maintenance()``, phase-09b; ``home_rail`` — the one motion op — phase-09c).
+(``maintenance()``, phase-09b; ``home_rail`` — the one motion op — phase-09c;
+``set_collision_sensitivity`` — the operator's level 1..3 override, one write, no
+motion — 2026-09-11, also available inside a session through
+``XArmDriver.request_set_collision_sensitivity`` / ``SettingResult``).
 The driver never homes the rail at connect (``RailNotHomedError`` by default,
 phase-09c); phase-09d adds ``XArmDriver.home_rail()`` for the runtime's
 operator-confirmed, twin-planned rail-homing maintenance motion on a driver
@@ -16,7 +19,14 @@ apollo-mavis-v2-core.
 """
 
 from . import units
-from .backstops import BACKSTOP_SDK_METHODS, apply_backstops, expected_backstop_sequence
+from .backstops import (
+    BACKSTOP_SDK_METHODS,
+    COLLISION_SENSITIVITY_LEVELS,
+    STATUS_ECHO_CODES,
+    apply_backstops,
+    expected_backstop_sequence,
+    set_collision_sensitivity,
+)
 from .config import ServoLimits, XArmDriverConfig
 from .driver import (
     READONLY_ALLOWED_SDK_ATTRS,
@@ -24,6 +34,7 @@ from .driver import (
     ArmFaultedError,
     DriverPhase,
     RecoveryResult,
+    SettingResult,
     XArmDriver,
 )
 from .events import (
@@ -76,11 +87,15 @@ __all__ = [
     "DriverPhase",
     "ArmFaultedError",
     "RecoveryResult",
+    "SettingResult",  # request_set_collision_sensitivity() outcome (2026-09-11)
     "READONLY_ALLOWED_SDK_METHODS",  # connect(readonly=True) call surface (phase-12)
     "READONLY_ALLOWED_SDK_ATTRS",
     "apply_backstops",
+    "set_collision_sensitivity",  # the operator's level override, one write (2026-09-11)
     "expected_backstop_sequence",
     "BACKSTOP_SDK_METHODS",
+    "COLLISION_SENSITIVITY_LEVELS",
+    "STATUS_ECHO_CODES",
     # events
     "DriverEvent",
     "FaultEvent",

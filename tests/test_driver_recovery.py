@@ -15,6 +15,7 @@ from apollo_mavis_v2_hardware.driver import (
     ArmFaultedError,
     DriverPhase,
     RecoveryResult,
+    SettingResult,
     XArmDriver,
 )
 from apollo_mavis_v2_hardware.events import (
@@ -57,9 +58,7 @@ def test_c24_recovery_sequence_reseed_from_measured() -> None:
     api = h["api"]
     try:
         drv.command_joints(np.array(seed) + 0.3)  # far target: keeps marching
-        events = collect_until(
-            drv, lambda evs: any(isinstance(e, RecoveredEvent) for e in evs)
-        )
+        events = collect_until(drv, lambda evs: any(isinstance(e, RecoveredEvent) for e in evs))
         # binding order: clean_error -> motion_enable -> set_mode(1) -> set_state(0)
         calls = api.calls
         i_clean = _last_index(calls, "clean_error")
@@ -83,9 +82,7 @@ def test_c24_recovery_sequence_reseed_from_measured() -> None:
 
 
 def test_c24_halves_limits_for_10s_then_restores() -> None:
-    drv, h = make_driver(
-        fake_kwargs={"fault_script": FaultScript(fault_at_tick=10, error_code=24)}
-    )
+    drv, h = make_driver(fake_kwargs={"fault_script": FaultScript(fault_at_tick=10, error_code=24)})
     try:
         drv.command_joints(np.full(7, 0.3))
         collect_until(drv, lambda evs: any(isinstance(e, RecoveredEvent) for e in evs))
@@ -99,9 +96,7 @@ def test_c24_halves_limits_for_10s_then_restores() -> None:
 
 
 def test_second_c24_inside_backoff_window_latches() -> None:
-    drv, h = make_driver(
-        fake_kwargs={"fault_script": FaultScript(fault_at_tick=10, error_code=24)}
-    )
+    drv, h = make_driver(fake_kwargs={"fault_script": FaultScript(fault_at_tick=10, error_code=24)})
     try:
         drv.command_joints(np.full(7, 0.3))
         collect_until(drv, lambda evs: any(isinstance(e, RecoveredEvent) for e in evs))
@@ -322,9 +317,7 @@ def test_error_111_latches_rail_only_stream_continues() -> None:
         drv.command_joints(np.concatenate([np.full(7, 0.2), [0.1]]))
         wait_until(lambda: len(api.sent_joints) > 10)
         api.inject_error(111, drop_mode=False)  # rail drop does not stop the arm
-        wait_until(
-            lambda: drv._rail.phase is RailPhase.RAIL_ERROR, msg="rail never latched"
-        )
+        wait_until(lambda: drv._rail.phase is RailPhase.RAIL_ERROR, msg="rail never latched")
         n0 = len(api.sent_joints)
         time.sleep(0.15)
         assert drv.phase is DriverPhase.STREAMING  # arm keeps streaming
@@ -350,8 +343,11 @@ def test_studio_conflict_warns_retries_then_latches() -> None:
         time.sleep(0.6)  # second grab within 5 s of the first retry
         api.mode = 0
         api.state = 2
-        wait_until(lambda: drv.phase is DriverPhase.LATCHED, timeout=5.0,
-                   msg="second conflict never latched")
+        wait_until(
+            lambda: drv.phase is DriverPhase.LATCHED,
+            timeout=5.0,
+            msg="second conflict never latched",
+        )
     finally:
         drv.disconnect()
 
@@ -541,9 +537,7 @@ def test_persistent_external_stop_latches_without_blaming_studio() -> None:
         wait_until(lambda: drv.phase is DriverPhase.STREAMING, msg="never retried mode 1")
         api.state = 3  # again, inside the 5 s window
         api.ready_to_move = False
-        wait_until(
-            lambda: drv.phase is DriverPhase.LATCHED, timeout=5.0, msg="never latched"
-        )
+        wait_until(lambda: drv.phase is DriverPhase.LATCHED, timeout=5.0, msg="never latched")
         with pytest.raises(ArmFaultedError) as exc:
             drv.command_joints(np.zeros(7))
         detail = str(exc.value)
@@ -592,9 +586,7 @@ def test_not_ready_beyond_the_grace_window_still_faults() -> None:
         api.ready_to_move = False  # persistent STATE_NOT_READY, no error code
         events = collect_until(
             drv,
-            lambda evs: any(
-                isinstance(e, FaultEvent) and e.source == "servo" for e in evs
-            ),
+            lambda evs: any(isinstance(e, FaultEvent) and e.source == "servo" for e in evs),
             timeout=3.0,
         )
         fault = next(e for e in events if isinstance(e, FaultEvent) and e.source == "servo")
@@ -612,9 +604,7 @@ def test_not_ready_grace_is_bounded_by_tick_count_too() -> None:
         wait_until(lambda: len(api.sent_joints) > 3)
         streamer = drv._streamer
         assert streamer is not None
-        assert streamer._grace_ticks_max == int(
-            0.3 * drv.cfg.servo.rate_hz
-        )  # 30 ticks at 100 Hz
+        assert streamer._grace_ticks_max == int(0.3 * drv.cfg.servo.rate_hz)  # 30 ticks at 100 Hz
         drv.drain_events()
         api.ready_to_move = False  # persistent not-ready
         collect_until(
@@ -624,5 +614,122 @@ def test_not_ready_grace_is_bounded_by_tick_count_too() -> None:
         )
         # at most one grace window's worth of ticks was ever swallowed
         assert streamer.not_ready_ticks <= streamer._grace_ticks_max
+    finally:
+        drv.disconnect()
+
+
+# -- request_set_collision_sensitivity() / setting_result() (2026-09-11) --------------------
+# The operator's in-session collision-sensitivity override: flagged on the caller's
+# thread, ONE SDK write on the driver's monitor thread, outcome as SettingResult. Same
+# shape as request_recovery; never touches the phase, the budget or the streamer.
+
+
+def test_request_set_collision_sensitivity_runs_one_write_on_the_monitor_thread() -> None:
+    drv, h = make_driver()
+    api = h["api"]
+    try:
+        assert drv.setting_result() is None
+        assert api.collision_sensitivity == 3  # connect applied cfg.collision_sensitivity
+        n_before = len(api.calls)
+        seen = _record_threads(api, "set_collision_sensitivity", "set_state", "motion_enable")
+        drv.request_set_collision_sensitivity(2)  # returns at once; nothing ran here
+        assert "set_collision_sensitivity" not in seen
+        wait_until(lambda: drv.setting_result() is not None, msg="no SettingResult")
+        res = drv.setting_result()
+        assert isinstance(res, SettingResult)
+        assert res == SettingResult(seq=1, ok=True, code=0, level=2, t_mono=res.t_mono, detail="")
+        assert res.t_mono > 0
+        assert seen == {"set_collision_sensitivity": "hw.a1.monitor"}  # the 5 Hz thread
+        # exactly one new SDK call: the apply_backstops step-(2) call with the new level
+        new_calls = api.calls[n_before:]
+        assert [c for c in new_calls if c[0].startswith(("set_", "motion_", "clean_"))] == [
+            ("set_collision_sensitivity", (2,), {})
+        ]
+        assert api.collision_sensitivity == 2
+        # nothing else changed: still streaming, no event, no budget slot, no recovery
+        assert drv.phase is DriverPhase.STREAMING
+        assert drv.recovery_result() is None and len(drv._recovery_times) == 0
+        assert not any(isinstance(e, (FaultEvent, RecoveredEvent)) for e in drv.drain_events())
+        # a second request bumps seq; the latest pending level wins if two land in one tick
+        drv.request_set_collision_sensitivity(3)
+        wait_until(lambda: (r := drv.setting_result()) is not None and r.seq == 2)
+        assert drv.setting_result().level == 3 and api.collision_sensitivity == 3
+    finally:
+        drv.disconnect()
+
+
+def test_request_set_collision_sensitivity_refuses_bad_levels_and_needs_a_connection() -> None:
+    drv, h = make_driver()
+    api = h["api"]
+    try:
+        for bad in (0, 4, 5, -1, 2.5, True, "2"):
+            with pytest.raises(CommandError):
+                drv.request_set_collision_sensitivity(bad)  # type: ignore[arg-type]
+        time.sleep(0.05)
+        assert drv.setting_result() is None  # nothing was queued
+        assert api.collision_sensitivity == 3
+    finally:
+        drv.disconnect()
+    with pytest.raises(CommandError):
+        drv.request_set_collision_sensitivity(2)  # disconnected
+    drv2, _ = make_driver(connect=False)
+    with pytest.raises(CommandError):
+        drv2.request_set_collision_sensitivity(2)
+    assert drv2.setting_result() is None
+
+
+def test_request_set_collision_sensitivity_status_echo_is_ok_with_a_note_and_exceptions_fail() -> (
+    None
+):
+    """set_collision_sensitivity returns the RAW uxbus reply (x3/xarm.py:964): a box with
+    an error latched answers ERR_CODE 1 for a write that went through - ok with the echo
+    named; a transport code (3) or an exception is not ok, and never raises."""
+    drv, h = make_driver()
+    api = h["api"]
+    try:
+        api.inject_error(1)  # the C31-under-load situation: LATCHED, error still latched
+        wait_until(lambda: drv.phase is DriverPhase.LATCHED)
+        real = api.set_collision_sensitivity
+
+        def echo(value, wait=True):
+            real(value, wait=wait)
+            return 1  # ERR_CODE status echo
+
+        api.set_collision_sensitivity = echo  # type: ignore[method-assign]
+        drv.request_set_collision_sensitivity(2)
+        wait_until(lambda: drv.setting_result() is not None)
+        res = drv.setting_result()
+        assert res.ok and res.code == 1 and res.level == 2
+        assert "status echo" in res.detail and "returned 1" in res.detail
+        assert api.collision_sensitivity == 2
+        assert drv.phase is DriverPhase.LATCHED  # the write does not recover anything
+        # a genuine failure code
+        api.set_collision_sensitivity = lambda value, wait=True: 3  # type: ignore[method-assign]
+        drv.request_set_collision_sensitivity(1)
+        wait_until(lambda: (r := drv.setting_result()) is not None and r.seq == 2)
+        res = drv.setting_result()
+        assert not res.ok and res.code == 3 and res.detail == "set_collision_sensitivity returned 3"
+        # an SDK exception: recorded, never raised out of the monitor thread
+
+        def boom(value, wait=True):
+            raise Exception("socket closed")
+
+        api.set_collision_sensitivity = boom  # type: ignore[method-assign]
+        drv.request_set_collision_sensitivity(3)
+        wait_until(lambda: (r := drv.setting_result()) is not None and r.seq == 3)
+        res = drv.setting_result()
+        assert not res.ok and res.code == -1
+        assert res.detail == "set_collision_sensitivity failed: Exception: socket closed"
+    finally:
+        drv.disconnect()
+
+
+def test_request_set_collision_sensitivity_is_refused_on_a_read_only_connection() -> None:
+    drv, h = make_driver(connect=False)
+    drv.connect(readonly=True)
+    try:
+        with pytest.raises(CommandError, match="read-only"):
+            drv.request_set_collision_sensitivity(2)
+        assert "set_collision_sensitivity" not in h["api"].call_names()
     finally:
         drv.disconnect()

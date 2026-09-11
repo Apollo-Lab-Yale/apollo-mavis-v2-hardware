@@ -4,7 +4,15 @@ Core is m/rad/quat-wxyz; the xArm SDK is mm + rad (drivers always construct
 ``XArmAPI(is_radian=True)`` — degrees never appear anywhere). Conversion
 happens exactly once, here; nothing else in the stack multiplies by 1000.
 Joints and torques pass through unchanged (rad, N·m). RPY convention =
-intrinsic XYZ per ``core.se3.rpy_to_quat`` (the xArm firmware convention).
+extrinsic XYZ (``R = Rz(yaw) @ Ry(pitch) @ Rx(roll)``, == intrinsic ZYX) per
+``core.se3.rpy_to_quat`` — the xArm firmware convention, verified against 15 hardware
+episodes on 2026-09-11 (before that core composed ``Rx @ Ry @ Rz``, which was wrong).
+
+The SDK reports the FLANGE (``tcp_offset`` is zero on both boxes): ``sdk_to_pose`` /
+``pose_to_sdk`` are the pure unit + RPY converters (flange in, flange out) and
+``sdk_to_tcp_pose`` / ``tcp_pose_to_sdk`` add the flange -> ``link_tcp`` composition
+of ``core.se3.flange_to_tcp`` (Rz(pi) + 0.172 m along tool z on a gripper arm, identity
+on a gripper-less one).
 """
 
 from __future__ import annotations
@@ -47,6 +55,23 @@ def sdk_to_pose(p: Sequence[float]) -> Pose:
     position = np.array([mm_to_m(p[0]), mm_to_m(p[1]), mm_to_m(p[2])])
     quat = se3.quat_normalize(se3.rpy_to_quat(p[3:6]))
     return Pose(position, quat)
+
+
+def sdk_to_tcp_pose(p: Sequence[float], *, gripper: bool) -> Pose:
+    """SDK flange ``[x_mm, y_mm, z_mm, r, p, y]`` -> the twin's ``link_tcp`` pose (core Pose).
+
+    The controller reports the FLANGE (``tcp_offset`` zero on both boxes);
+    ``ArmState.ee_pose`` is documented as the TCP, so the driver goes through here:
+    ``gripper=True`` composes ``se3.flange_to_tcp`` (Rz(pi), +0.172 m along tool z),
+    ``gripper=False`` returns the flange unchanged (a gripper-less arm's ``link_tcp`` IS
+    the flange). Inverse: :func:`tcp_pose_to_sdk`.
+    """
+    return se3.flange_to_tcp(sdk_to_pose(p), gripper=gripper)
+
+
+def tcp_pose_to_sdk(pose: Pose, *, gripper: bool) -> list[float]:
+    """Inverse of :func:`sdk_to_tcp_pose`: TCP pose -> SDK flange ``[mm x3, rpy rad x3]``."""
+    return pose_to_sdk(se3.tcp_to_flange(pose, gripper=gripper))
 
 
 def frac_to_pulse(f: float) -> int:

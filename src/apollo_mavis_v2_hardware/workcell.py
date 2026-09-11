@@ -19,7 +19,7 @@ from pydantic import BaseModel, Field
 
 from .cameras import make_camera
 from .config import XArmDriverConfig
-from .driver import RecoveryResult, XArmDriver
+from .driver import RecoveryResult, SettingResult, XArmDriver
 from .events import DriverEvent
 from .netsetup import NetSetup
 from .rail import RailNotHomedError
@@ -155,6 +155,27 @@ class HardwareWorkcell(WorkcellInterface):
         """Most recent recovery outcome of one arm (None before the first)."""
         arm = self.arms[arm_id]
         getter = getattr(arm, "recovery_result", None)
+        return getter() if getter is not None else None
+
+    def request_set_collision_sensitivity(self, arm_id: str, level: int) -> None:
+        """Operator-requested collision-sensitivity override of one arm inside a
+        session (``XArmDriver.request_set_collision_sensitivity``, 2026-09-11):
+        executed on that driver's monitor thread, outcome via
+        :meth:`setting_result`. Unknown arm -> ``KeyError``; a driver without the
+        channel -> ``CommandError``; a level outside 1..3 -> ``CommandError`` from
+        the driver. The sibling of :meth:`request_recovery`, so the runtime's
+        wrapped workcell forwards it the same way."""
+        arm = self.arms[arm_id]
+        request = getattr(arm, "request_set_collision_sensitivity", None)
+        if request is None:
+            raise CommandError(f"{arm_id}: driver has no collision-sensitivity channel")
+        request(level)
+
+    def setting_result(self, arm_id: str) -> SettingResult | None:
+        """Most recent collision-sensitivity write outcome of one arm (None before
+        the first)."""
+        arm = self.arms[arm_id]
+        getter = getattr(arm, "setting_result", None)
         return getter() if getter is not None else None
 
     # -- cameras ------------------------------------------------------------------

@@ -770,7 +770,19 @@ def test_maintenance_refusals_never_touch_the_sdk() -> None:
     mon, h = make_monitor({}, gripper="none")
     with pytest.raises(ValueError):
         mon.maintenance("reboot")  # type: ignore[arg-type]
-    assert MAINTENANCE_OPS == ("clear_errors", "apply_backstops", "recover", "home_rail")
+    assert MAINTENANCE_OPS == (
+        "clear_errors",
+        "apply_backstops",
+        "recover",
+        "home_rail",
+        "set_collision_sensitivity",
+    )
+    assert set(MAINTENANCE_SDK_METHODS) == set(MAINTENANCE_OPS)
+    assert MAINTENANCE_SDK_METHODS["set_collision_sensitivity"] == {"set_collision_sensitivity"}
+    # set_collision_sensitivity needs a level of 1..3, refused (not raised) otherwise
+    for bad in (None, 0, 4, 5, 2.5, True, "2"):
+        out = mon.maintenance("set_collision_sensitivity", level=bad, timeout_s=0.5)  # type: ignore[arg-type]
+        assert not out.ok and out.detail.startswith("set_collision_sensitivity needs a level")
     # not started: off
     out = mon.maintenance("clear_errors", timeout_s=0.5)
     assert not out.ok and "monitor off" in out.detail and "raw" not in h
@@ -1370,5 +1382,144 @@ def test_home_rail_caller_timeout_abandons_but_the_homing_still_completes() -> N
         raw = h["raw"]
         assert raw.rail_homed is True and raw.rail_enabled is True and raw.homing_completed == 1
         wait_sample(mon, lambda x: x.rail_homed is True)
+    finally:
+        mon.stop()
+
+
+# -- set_collision_sensitivity (2026-09-11): the operator's level override --------------
+
+
+def test_maintenance_set_collision_sensitivity_writes_one_call_and_judges_from_the_read_back():
+    mon, h = make_monitor({"collision_sensitivity": 3, "has_rail": True}, proxy=True)
+    try:
+        mon.start()
+        s0 = wait_sample(mon, lambda x: x.collision_sensitivity == 3)
+        raw = h["raw"]
+        threads = record_threads(raw, "set_collision_sensitivity")
+        before_state = (raw.state, raw.mode, raw.motion_enabled)
+        out = mon.maintenance("set_collision_sensitivity", _backstop_cfg(), timeout_s=3.0, level=2)
+        assert isinstance(out, MaintenanceOutcome)
+        assert out.ok, out.detail
+        assert out.op == "set_collision_sensitivity" and out.arm_id == "grip"
+        assert out.detail == (
+            "collision sensitivity set to 2 (was 3; the config value 3 is re-applied at the "
+            "next connect)"
+        )
+        assert out.sdk_codes == {"set_collision_sensitivity": 0} and out.warnings == ()
+        assert out.before is not None and out.before.collision_sensitivity == 3
+        assert out.before.seq > s0.seq  # a fresh before-sample
+        assert out.after is not None and out.after.collision_sensitivity == 2
+        assert out.after.seq > out.before.seq
+        assert out.after.rail_present is True  # slow fields refreshed right after the op
+        assert set(threads.values()) == {"hw.grip.monitor-ro"}  # ON THE POLL THREAD
+        assert (raw.state, raw.mode, raw.motion_enabled) == before_state  # no enable, no mode
+        assert raw.homing_started == 0 and raw.rail_pos_commands == []  # nothing moved
+        assert "save_conf" not in raw.call_names()
+        assert mon.maintenance_busy is False and mon.status == "running"
+        wait_sample(mon, lambda x: x.seq > out.after.seq and x.collision_sensitivity == 2)
+        # without a driver config the detail still says the value is volatile
+        out2 = mon.maintenance("set_collision_sensitivity", timeout_s=3.0, level=1)
+        assert out2.ok and out2.detail == (
+            "collision sensitivity set to 1 (was 2; the config value is re-applied at the "
+            "next connect)"
+        )
+    finally:
+        mon.stop()
+    api = h["api"]
+    mutating = [n for n in api.methods if n not in READ_ONLY_SDK_METHODS]
+    assert mutating == ["set_collision_sensitivity", "set_collision_sensitivity"]  # ONE per op
+    assert set(mutating) == MAINTENANCE_SDK_METHODS["set_collision_sensitivity"]
+    assert set(api.attrs) <= READ_ONLY_SDK_ATTRS
+    assert [c for c in h["raw"].calls if c[0] == "set_collision_sensitivity"] == [
+        ("set_collision_sensitivity", (2,), {}),
+        ("set_collision_sensitivity", (1,), {}),
+    ]
+
+
+def test_maintenance_set_collision_sensitivity_not_ok_when_the_read_back_disagrees():
+    mon, h = make_monitor({"collision_sensitivity": 3}, gripper="none", arm_id="view")
+    try:
+        mon.start()
+        wait_sample(mon, lambda x: x.collision_sensitivity == 3)
+        raw = h["raw"]
+        # the SDK answers 0 but the controller does not take the value (rich frame keeps 3)
+        raw.set_collision_sensitivity = lambda value, wait=True: 0  # type: ignore[method-assign]
+        t0 = time.monotonic()
+        out = mon.maintenance("set_collision_sensitivity", _backstop_cfg(), timeout_s=3.0, level=2)
+        assert time.monotonic() - t0 >= monitor_mod.BACKSTOP_READBACK_SETTLE_S  # it waited
+        assert not out.ok
+        assert out.detail == "collision sensitivity still reads 3 after writing 2"
+        assert out.sdk_codes == {"set_collision_sensitivity": 0}
+        assert out.after is not None and out.after.collision_sensitivity == 3
+        # a transport code is a failure whatever the read-back says
+        real = FakeXArmAPI.set_collision_sensitivity
+
+        def timeout(value, wait=True):
+            real(raw, value, wait=wait)
+            return 3  # ERR_TOUT
+
+        raw.set_collision_sensitivity = timeout  # type: ignore[method-assign]
+        out = mon.maintenance("set_collision_sensitivity", timeout_s=3.0, level=1)
+        assert not out.ok and out.detail == "set_collision_sensitivity returned 3"
+        assert out.warnings == ("set_collision_sensitivity returned 3",)
+    finally:
+        mon.stop()
+
+
+def test_maintenance_set_collision_sensitivity_status_echo_is_diagnosis_not_failure():
+    """set_collision_sensitivity returns the RAW reply (x3/xarm.py:964, no _check_code): a
+    box with C19 latched echoes ERR_CODE 1 for a write that went through. Like
+    clear_errors, the read-back decides; the code stays in sdk_codes."""
+    for echo in sorted(STATUS_ECHO_CODES):
+        mon, h = make_monitor({"collision_sensitivity": 3}, gripper="none", arm_id="view")
+        try:
+            mon.start()
+            wait_sample(mon, lambda x: x.collision_sensitivity == 3)
+            raw = h["raw"]
+            raw.error_code = 19
+            wait_sample(mon, lambda x: x.error_code == 19)
+            real = FakeXArmAPI.set_collision_sensitivity
+
+            def stored_with_echo(value, wait=True, raw=raw, echo=echo, real=real):
+                real(raw, value, wait=wait)
+                return echo
+
+            raw.set_collision_sensitivity = stored_with_echo  # type: ignore[method-assign]
+            out = mon.maintenance(
+                "set_collision_sensitivity", _backstop_cfg(), timeout_s=3.0, level=2
+            )
+            assert out.ok, f"echo {echo} judged a failure: {out.detail}"
+            assert out.detail == (
+                "collision sensitivity set to 2 (was 3; the config value 3 is re-applied at "
+                f"the next connect) (set_collision_sensitivity returned {echo}: status echo, "
+                "value verified by read-back)"
+            )
+            assert out.sdk_codes == {"set_collision_sensitivity": echo}
+            assert out.after is not None and out.after.collision_sensitivity == 2
+            assert out.after.error_code == 19  # the op clears nothing
+        finally:
+            mon.stop()
+
+
+def test_maintenance_set_collision_sensitivity_refusals_never_touch_the_sdk():
+    mon, h = make_monitor({}, gripper="none")
+    # not started
+    out = mon.maintenance("set_collision_sensitivity", timeout_s=0.5, level=2)
+    assert not out.ok and "monitor off" in out.detail and "raw" not in h
+    try:
+        mon.start()
+        wait_sample(mon)
+        raw = h["raw"]
+        for bad in (None, 0, 4, 5):
+            out = mon.maintenance("set_collision_sensitivity", timeout_s=0.5, level=bad)
+            assert not out.ok
+            assert out.detail.startswith(
+                f"set_collision_sensitivity needs a level of 1, 2 or 3 (got {bad!r})"
+            )
+        mon.disconnect()  # hand-over
+        out = mon.maintenance("set_collision_sensitivity", timeout_s=0.5, level=2)
+        assert not out.ok and "monitor paused" in out.detail
+        assert "set_collision_sensitivity" not in raw.call_names()
+        assert mon.maintenance_busy is False
     finally:
         mon.stop()

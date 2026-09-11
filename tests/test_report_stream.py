@@ -4,6 +4,7 @@ import math
 import time
 
 import pytest
+from apollo_mavis_v2_core import se3
 from conftest import FakeClock
 from fakes.fake_xarm_api import FakeXArmAPI
 from fakes.report_replayer import (
@@ -92,7 +93,9 @@ def test_staleness_flips_at_150ms_and_recovers_via_replayer() -> None:
 
 
 def test_state_snapshot_carries_frame_values_in_meters() -> None:
-    """Cartesian mm from the wire -> exactly one mm->m conversion in ArmState."""
+    """Cartesian mm from the wire -> exactly one mm->m conversion in ArmState, and the
+    flange the wire carries becomes the twin's link_tcp (Rz(pi), +0.172 m along tool
+    z; 2026-09-11) - the default driver config has a gripper."""
     q = [0.0, -0.5, 0.0, 0.3, 0.0, 0.2, 0.0]
     tcp = [300.0, -50.0, 220.0, math.pi, 0.0, 0.0]
     frames = [build_real_frame(q, tcp, [0.1] * 7)]
@@ -107,8 +110,13 @@ def test_state_snapshot_carries_frame_values_in_meters() -> None:
         wait_until(lambda: not drv.get_state().stale)
         state = drv.get_state()
         assert state.q == pytest.approx(q, abs=1e-6)
-        assert state.ee_pose.position == pytest.approx([0.3, -0.05, 0.22], abs=1e-6)
-        assert abs(state.ee_pose.orientation[1]) == pytest.approx(1.0, abs=1e-6)
+        # roll pi = tool down: the TCP sits 0.172 m BELOW the flange; Rx(pi).Rz(pi) = Ry(pi)
+        assert state.ee_pose.position == pytest.approx([0.3, -0.05, 0.048], abs=1e-6)
+        assert abs(state.ee_pose.orientation[2]) == pytest.approx(1.0, abs=1e-6)
+        # the flange is still visible through the inverse composition
+        flange = se3.tcp_to_flange(state.ee_pose, gripper=True)
+        assert flange.position == pytest.approx([0.3, -0.05, 0.22], abs=1e-6)
+        assert se3.quat_geodesic(flange.orientation, se3.rpy_to_quat(tcp[3:])) < 1e-6
         assert state.mode == 1 and state.state == 0
     finally:
         drv.disconnect()

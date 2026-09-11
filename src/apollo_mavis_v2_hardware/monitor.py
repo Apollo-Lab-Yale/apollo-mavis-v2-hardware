@@ -26,7 +26,13 @@ full-travel sweep at the arm's CURRENT posture) and session-less; the request
 carries the posture the sweep assumed and the op refuses, before any write,
 when the arm has moved or a controller error is latched. ``motion_enable`` is
 never part of it (the track is a separate RS-485 axis; the arm stays braked).
-``recover`` (enable + servo mode) needs a session driver and is refused here.
+``set_collision_sensitivity`` (2026-09-11) = exactly one
+``set_collision_sensitivity(level)`` with the operator's level 1..3
+(``backstops.set_collision_sensitivity``; the request carries ``level``, anything
+else is refused before the queue), judged from the rich-frame read-back like
+``apply_backstops``; no motion, volatile - the next connect re-applies the
+config value. ``recover`` (enable + servo mode) needs a session driver and is
+refused here.
 Maintenance requests are queued and executed ON THE POLL THREAD (one
 ``XArmAPI`` is never used from two threads); the caller only waits.
 ``tests/test_monitor.py`` runs all of it against a call-logging fake and
@@ -93,7 +99,13 @@ from dataclasses import dataclass, field
 from typing import Any, Literal
 
 from . import units
-from .backstops import BACKSTOP_SDK_METHODS, apply_backstops
+from .backstops import (
+    BACKSTOP_SDK_METHODS,
+    COLLISION_SENSITIVITY_LEVELS,
+    STATUS_ECHO_CODES,
+    apply_backstops,
+    set_collision_sensitivity,
+)
 from .config import XArmDriverConfig
 from .driver import _default_api_factory
 from .rail import HOME_RAIL_SDK_WAIT_S  # shared with XArmDriver.home_rail (phase-09d)
@@ -102,15 +114,21 @@ logger = logging.getLogger(__name__)
 
 ArmMonitorStatus = Literal["off", "connecting", "running", "stale", "paused", "error"]
 GripperKind = Literal["xarm", "xarm_g2", "none"]
-MaintenanceOp = Literal["clear_errors", "apply_backstops", "recover", "home_rail"]
-MAINTENANCE_OPS: tuple[str, ...] = ("clear_errors", "apply_backstops", "recover", "home_rail")
+MaintenanceOp = Literal[
+    "clear_errors", "apply_backstops", "recover", "home_rail", "set_collision_sensitivity"
+]
+MAINTENANCE_OPS: tuple[str, ...] = (
+    "clear_errors",
+    "apply_backstops",
+    "recover",
+    "home_rail",
+    "set_collision_sensitivity",
+)
 
-# Controller STATUS-ECHO codes: the raw ``UxbusState`` values a control box answers
-# with when something is latched — 1 ERR_CODE, 2 WAR_CODE, 9 STATE_NOT_READY. SDK
-# ``_check_code`` maps exactly these to 0 for every non-move call, so they are NOT
-# command failures. Only ``clean_error`` / ``clean_warn`` return them unmapped
-# (``x3/base.py:2394-2413``); see :meth:`ArmStateMonitor._judge`.
-STATUS_ECHO_CODES: frozenset[int] = frozenset({1, 2, 9})
+# STATUS_ECHO_CODES (1 ERR_CODE, 2 WAR_CODE, 9 STATE_NOT_READY - the raw ``UxbusState``
+# echoes a box with something latched answers; NOT command failures) is defined in
+# ``backstops.py`` (the leaf both this module and ``driver.py`` import) and imported
+# above, so ``monitor.STATUS_ECHO_CODES`` keeps working; see :meth:`ArmStateMonitor._judge`.
 
 # ---------------------------------------------------------------------------
 # ZERO-WRITE ALLOWLIST — every XArmAPI member the POLLING may touch. Anything
@@ -124,7 +142,9 @@ READ_ONLY_SDK_METHODS: frozenset[str] = frozenset(
         "connect",
         "disconnect",
         "get_servo_angle",  # 7 joint angles, rad (is_radian=True)
-        "get_position",  # flange pose, mm + rad (tcp_offset is zero on both boxes)
+        "get_position",  # FLANGE pose, mm + rad (tcp_offset is zero on both boxes); the RPY
+        #   is extrinsic XYZ (Rz.Ry.Rx); the TCP is flange (+) (Rz(pi), +0.172 z) on a gripper
+        #   arm - see units.sdk_to_tcp_pose. ArmMonitorSample.tcp_pose stays the raw flange.
         "get_err_warn_code",  # [error_code, warn_code]
         "get_linear_track_registers",  # {pos, status, error, is_enabled, on_zero, ...}
         "get_gripper_g2_position",  # G2: int mm — same call as G2Gripper.poll()
@@ -143,6 +163,8 @@ READ_ONLY_SDK_ATTRS: frozenset[str] = frozenset(
 # Complete write set per maintenance operation (executed on the poll thread,
 # only on an explicit request). "recover" is refused by the monitor. "home_rail"
 # is the ONE op that moves something (the track carriage) — no motion_enable.
+# "set_collision_sensitivity" (2026-09-11) is the operator's level override: one
+# write, the same call apply_backstops issues at step (2), no motion.
 MAINTENANCE_SDK_METHODS: Mapping[str, frozenset[str]] = {
     "clear_errors": frozenset({"clean_error", "clean_warn"}),
     "apply_backstops": frozenset(BACKSTOP_SDK_METHODS),
@@ -150,6 +172,7 @@ MAINTENANCE_SDK_METHODS: Mapping[str, frozenset[str]] = {
     "home_rail": frozenset(
         {"set_linear_track_back_origin", "set_linear_track_enable", "set_linear_track_speed"}
     ),
+    "set_collision_sensitivity": frozenset({"set_collision_sensitivity"}),
 }
 
 MAX_RECONNECT_S = 10.0  # exponential backoff cap
@@ -198,7 +221,7 @@ class ArmMonitorSample:
     seq: int
     t_mono: float
     q: tuple[float, ...]  # 7 joint angles, rad, controller order (identity to the twin)
-    tcp_pose: tuple[float, ...]  # [x, y, z m, roll, pitch, yaw rad] base frame; () if unread
+    tcp_pose: tuple[float, ...]  # FLANGE [x, y, z m, roll, pitch, yaw rad] base frame; () if unread
     error_code: int = 0
     warn_code: int = 0
     state: int | None = None  # controller state (4 = stopped / not enabled)
@@ -241,9 +264,20 @@ class _MaintenanceRequest:
 
     ``expected_q`` / ``q_tol_rad`` belong to ``home_rail``: the 7 joint angles the
     runtime's rail sweep was checked at; the op refuses before its first write when
-    the before-sample deviates by more than ``q_tol_rad`` on any joint."""
+    the before-sample deviates by more than ``q_tol_rad`` on any joint. ``level``
+    belongs to ``set_collision_sensitivity``: the operator's level (1..3, validated
+    in :meth:`ArmStateMonitor.maintenance`)."""
 
-    __slots__ = ("op", "driver_cfg", "expected_q", "q_tol_rad", "done", "outcome", "abandoned")
+    __slots__ = (
+        "op",
+        "driver_cfg",
+        "expected_q",
+        "q_tol_rad",
+        "level",
+        "done",
+        "outcome",
+        "abandoned",
+    )
 
     def __init__(
         self,
@@ -251,11 +285,13 @@ class _MaintenanceRequest:
         driver_cfg: XArmDriverConfig | None,
         expected_q: tuple[float, ...] | None = None,
         q_tol_rad: float = HOME_RAIL_Q_TOL_RAD,
+        level: int | None = None,
     ) -> None:
         self.op = op
         self.driver_cfg = driver_cfg
         self.expected_q = expected_q
         self.q_tol_rad = float(q_tol_rad)
+        self.level = level
         self.done = threading.Event()
         self.outcome: MaintenanceOutcome | None = None
         self.abandoned = False  # the caller timed out; nobody reads the outcome
@@ -414,6 +450,7 @@ class ArmStateMonitor:
         *,
         expected_q: tuple[float, ...] | list[float] | None = None,
         q_tol_rad: float = HOME_RAIL_Q_TOL_RAD,
+        level: int | None = None,
     ) -> MaintenanceOutcome:
         """Run one explicit maintenance operation ON THE POLL THREAD and wait for it.
 
@@ -431,6 +468,13 @@ class ArmStateMonitor:
         ``set_linear_track_speed(cfg.rail_speed_mm_s)``; ``ok`` is judged from the
         after-sample registers only (``on_zero == 1``, ``is_enabled == 1``,
         ``error == 0``), never from the SDK return codes (module docstring).
+        ``set_collision_sensitivity`` (2026-09-11): needs ``level`` in 1..3 (refused
+        with ``ok=False`` otherwise, nothing queued); writes exactly
+        ``set_collision_sensitivity(level, wait=False)``, waits up to
+        ``BACKSTOP_READBACK_SETTLE_S`` for the rich frame to echo it, and is ``ok``
+        iff the after-sample reads ``collision_sensitivity == level`` (the SDK code
+        is diagnosis; a ``STATUS_ECHO_CODES`` echo is not a failure). ``driver_cfg``
+        is optional here and only names the config value the next connect restores.
         ``recover`` needs a session driver -> ``ok=False``. Not connected / paused
         / stopped -> ``ok=False``. The outcome carries the SDK return codes in
         call order, the sample right before and the sample right after (slow
@@ -446,6 +490,20 @@ class ArmStateMonitor:
             return self._refuse(op, "recover needs a session")
         if op == "apply_backstops" and driver_cfg is None:
             return self._refuse(op, "apply_backstops needs the arm's driver config")
+        if op == "set_collision_sensitivity":
+            if (
+                level is None
+                or isinstance(level, bool)
+                or int(level) != level
+                or int(level) not in COLLISION_SENSITIVITY_LEVELS
+            ):
+                return self._refuse(
+                    op,
+                    "set_collision_sensitivity needs a level of 1, 2 or 3 "
+                    f"(got {level!r}); 0 turns detection off and 4 / 5 false-trigger "
+                    "under payload",
+                )
+            level = int(level)
         expected: tuple[float, ...] | None = None
         if op == "home_rail":
             if driver_cfg is None:
@@ -467,7 +525,7 @@ class ArmStateMonitor:
                 status, detail = self._status, self._detail
                 req = None
             else:
-                req = _MaintenanceRequest(op, driver_cfg, expected, q_tol_rad)
+                req = _MaintenanceRequest(op, driver_cfg, expected, q_tol_rad, level=level)
                 self._requests.append(req)
                 self._wake.set()  # do not wait out the current poll period
         if req is None:
@@ -740,6 +798,13 @@ class ArmStateMonitor:
                 warnings = apply_backstops(api, req.driver_cfg, codes)
                 if self._current(gen):  # a hand-over skips the read-back wait too
                     self._settle_backstops(api, req.driver_cfg)
+            elif req.op == "set_collision_sensitivity":
+                assert req.level is not None  # checked in maintenance()
+                # ONE write (the apply_backstops step-(2) call with the operator's
+                # level); the warnings list is the non-zero code, if any
+                warnings = set_collision_sensitivity(api, req.level, codes)
+                if self._current(gen):
+                    self._settle_backstops(api, sensitivity=req.level)
             elif req.op == "home_rail":
                 assert req.driver_cfg is not None  # checked in maintenance()
                 refusal = self._home_rail_refusal(req, before, prev_seq)
@@ -811,17 +876,26 @@ class ArmStateMonitor:
         self._poll(gen, api, slow=True)
         return self._sample
 
-    def _settle_backstops(self, api: Any, cfg: XArmDriverConfig) -> None:
-        """Wait (bounded) for the rich report frame to echo the values just set."""
+    def _settle_backstops(
+        self,
+        api: Any,
+        cfg: XArmDriverConfig | None = None,
+        *,
+        sensitivity: int | None = None,
+    ) -> None:
+        """Wait (bounded by ``BACKSTOP_READBACK_SETTLE_S``) for the rich report frame
+        to echo the values just set: with ``cfg`` the whole ``apply_backstops`` set
+        (sensitivity AND payload), with a bare ``sensitivity`` (the
+        ``set_collision_sensitivity`` op) that level alone."""
+        want_sens = cfg.collision_sensitivity if cfg is not None else sensitivity
+        want_kg = cfg.tcp_load_kg if cfg is not None else None
         deadline = time.monotonic() + BACKSTOP_READBACK_SETTLE_S
         while True:
             sens = _as_int(getattr(api, "collision_sensitivity", None))
             kg, _cog = _parse_tcp_load(getattr(api, "tcp_load", None))
-            if (
-                sens == cfg.collision_sensitivity
-                and kg is not None
-                and abs(kg - cfg.tcp_load_kg) <= TCP_LOAD_MATCH_KG
-            ):
+            sens_ok = want_sens is None or sens == want_sens
+            kg_ok = want_kg is None or (kg is not None and abs(kg - want_kg) <= TCP_LOAD_MATCH_KG)
+            if sens_ok and kg_ok:
                 return
             if time.monotonic() >= deadline:
                 return
@@ -911,6 +985,39 @@ class ArmStateMonitor:
                     parts.append(f"controller warning {warn0}")
                 return True, "cleared " + " and ".join(parts)
             return True, "no controller error or warning was latched; clean_error + clean_warn sent"
+        if req.op == "set_collision_sensitivity":
+            # set_collision_sensitivity returns the RAW uxbus reply too (x3/xarm.py:964,
+            # no _check_code), so a latched box echoes 1 / 2 / 9 for a write that went
+            # through: like clear_errors, the READ-BACK decides and the code is diagnosis.
+            level = req.level
+            assert level is not None  # checked in maintenance()
+            if failed:
+                return False, "; ".join(failed)
+            echo = "; ".join(f"{n} returned {c}" for n, c in codes.items() if c != 0)
+            if after is None:
+                return False, (
+                    f"collision sensitivity {level} written but not verified"
+                    + (f" ({echo}: status echo)" if echo else "")
+                )
+            if after.collision_sensitivity != level:
+                return False, (
+                    f"collision sensitivity still reads {after.collision_sensitivity} "
+                    f"after writing {level}" + (f" ({echo})" if echo else "")
+                )
+            notes: list[str] = []
+            if before is not None and before.collision_sensitivity is not None:
+                notes.append(f"was {before.collision_sensitivity}")
+            if req.driver_cfg is not None:
+                notes.append(
+                    f"the config value {req.driver_cfg.collision_sensitivity} is re-applied "
+                    "at the next connect"
+                )
+            else:
+                notes.append("the config value is re-applied at the next connect")
+            detail = f"collision sensitivity set to {level} ({'; '.join(notes)})"
+            if echo:
+                detail += f" ({echo}: status echo, value verified by read-back)"
+            return True, detail
         # apply_backstops
         cfg = req.driver_cfg
         assert cfg is not None

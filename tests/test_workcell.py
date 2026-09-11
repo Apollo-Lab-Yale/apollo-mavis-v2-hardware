@@ -9,7 +9,7 @@ from apollo_mavis_v2_core.schemas import ArmConfig, PoseModel, WorkcellConfig
 from fakes.fake_xarm_api import FakeXArmAPI
 from test_driver_connect import wait_until
 
-from apollo_mavis_v2_hardware.driver import DriverPhase, XArmDriver
+from apollo_mavis_v2_hardware.driver import DriverPhase, SettingResult, XArmDriver
 from apollo_mavis_v2_hardware.events import FaultEvent, RecoveredEvent, ReseedEvent
 from apollo_mavis_v2_hardware.netsetup.types import MatchResult
 from apollo_mavis_v2_hardware.rail import RailNotHomedError
@@ -354,3 +354,42 @@ def test_request_recovery_on_a_driver_without_the_channel_raises_command_error()
     assert wc.recovery_result("arm1") is None
     with pytest.raises(CommandError):
         wc.request_recovery("arm1")
+
+
+# -- 2026-09-11: the collision-sensitivity channel, the sibling of request_recovery ---------
+
+
+def test_request_set_collision_sensitivity_targets_one_arm_and_publishes_a_setting_result():
+    wc, apis = make_workcell()
+    try:
+        wc.bring_up(timeout_s=20.0)
+        assert wc.setting_result("arm1") is None and wc.setting_result("arm2") is None
+        assert apis["arm1"].collision_sensitivity == 3  # connect applied the config value
+        wc.request_set_collision_sensitivity("arm1", 2)
+        wait_until(lambda: wc.setting_result("arm1") is not None)
+        res = wc.setting_result("arm1")
+        assert isinstance(res, SettingResult) and res.ok and res.level == 2 and res.code == 0
+        assert res.seq == 1 and res.detail == ""
+        assert apis["arm1"].collision_sensitivity == 2
+        assert apis["arm2"].collision_sensitivity == 3  # the sibling is untouched
+        assert wc.setting_result("arm2") is None
+        # the write ran on arm1's monitor thread, not here, and moved nothing
+        calls = [c for c in apis["arm1"].calls if c[0] == "set_collision_sensitivity"]
+        assert calls[-1] == ("set_collision_sensitivity", (2,), {})
+        assert "motion_enable" not in [c[0] for c in apis["arm1"].calls[-3:]]
+        assert wc.arms["arm1"].phase is DriverPhase.STREAMING
+        with pytest.raises(KeyError):
+            wc.request_set_collision_sensitivity("nope", 2)
+        with pytest.raises(CommandError):
+            wc.request_set_collision_sensitivity("arm1", 4)  # the driver refuses 4 / 5 / 0
+        assert wc.setting_result("arm1").seq == 1  # nothing new was written
+    finally:
+        wc.shutdown()
+
+
+def test_request_set_collision_sensitivity_on_a_driver_without_the_channel_raises():
+    wc, _ = make_workcell(n_arms=1)
+    wc.arms["arm1"] = SimpleNamespace(get_state=lambda: None)  # foreign ArmInterface impl
+    assert wc.setting_result("arm1") is None
+    with pytest.raises(CommandError):
+        wc.request_set_collision_sensitivity("arm1", 2)

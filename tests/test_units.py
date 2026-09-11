@@ -82,8 +82,65 @@ def test_rail_round_trip(x: float) -> None:
     assert units.rail_mm_to_m(units.rail_m_to_mm(x)) == pytest.approx(x, abs=1e-3)
 
 
-def test_rpy_convention_matches_core_se3() -> None:
-    """RPY = intrinsic XYZ per core.se3 (the xArm firmware convention)."""
-    rpy = np.array([0.4, 0.5, -0.6])
-    pose = units.sdk_to_pose([0, 0, 0, *rpy])
-    assert se3.quat_to_rpy(pose.orientation) == pytest.approx(rpy, abs=1e-9)
+def _rx(a: float) -> np.ndarray:
+    c, s = math.cos(a), math.sin(a)
+    return np.array([[1.0, 0.0, 0.0], [0.0, c, -s], [0.0, s, c]])
+
+
+def _ry(a: float) -> np.ndarray:
+    c, s = math.cos(a), math.sin(a)
+    return np.array([[c, 0.0, s], [0.0, 1.0, 0.0], [-s, 0.0, c]])
+
+
+def _rz(a: float) -> np.ndarray:
+    c, s = math.cos(a), math.sin(a)
+    return np.array([[c, -s, 0.0], [s, c, 0.0], [0.0, 0.0, 1.0]])
+
+
+def test_rpy_convention_is_extrinsic_xyz() -> None:
+    """RPY = extrinsic XYZ, R = Rz(yaw) @ Ry(pitch) @ Rx(roll) (the xArm firmware
+    convention, verified against 15 hardware episodes 2026-09-11) - a numeric pin, not
+    just the self-consistency the roundtrip above already has."""
+    r, p, y = 0.4, 0.5, -0.6
+    pose = units.sdk_to_pose([0, 0, 0, r, p, y])
+    assert np.allclose(se3.quat_to_mat(pose.orientation), _rz(y) @ _ry(p) @ _rx(r), atol=1e-12)
+    assert se3.quat_to_rpy(pose.orientation) == pytest.approx([r, p, y], abs=1e-9)
+    # the pre-2026-09-11 composition is measurably different for two non-zero angles
+    wrong = se3.mat_to_quat(_rx(r) @ _ry(p) @ _rz(y))
+    assert se3.quat_geodesic(pose.orientation, wrong) > 0.1
+
+
+def test_sdk_to_tcp_pose_is_flange_plus_rz_pi_plus_172mm() -> None:
+    """Tool pointing DOWN (roll pi): the 0.172 m TCP offset lowers the pose and the
+    Rz(pi) gripper mount turns Rx(pi) into Rx(pi).Rz(pi) = Ry(pi)."""
+    sdk = [300.0, -50.0, 220.0, math.pi, 0.0, 0.0]
+    tcp = units.sdk_to_tcp_pose(sdk, gripper=True)
+    assert tcp.position == pytest.approx([0.3, -0.05, 0.048], abs=1e-9)
+    assert np.abs(tcp.orientation) == pytest.approx([0.0, 0.0, 1.0, 0.0], abs=1e-9)
+    assert np.allclose(se3.quat_to_mat(tcp.orientation), _ry(math.pi), atol=1e-9)
+    # inverse recovers the SDK flange numbers
+    assert units.tcp_pose_to_sdk(tcp, gripper=True)[:3] == pytest.approx(sdk[:3], abs=1e-6)
+    flange = se3.tcp_to_flange(tcp, gripper=True)
+    assert se3.quat_geodesic(flange.orientation, units.sdk_to_pose(sdk).orientation) < 1e-9
+
+
+def test_sdk_to_tcp_pose_gripperless_is_the_flange() -> None:
+    sdk = [500.0, -100.0, 250.0, math.pi / 4, -0.3, 1.2]
+    tcp = units.sdk_to_tcp_pose(sdk, gripper=False)
+    flange = units.sdk_to_pose(sdk)
+    assert tcp.position == pytest.approx(flange.position)
+    assert tcp.orientation == pytest.approx(flange.orientation)
+    assert units.tcp_pose_to_sdk(tcp, gripper=False) == pytest.approx(sdk, abs=1e-5)
+
+
+@given(
+    st.floats(-math.pi, math.pi, allow_nan=False),
+    st.floats(-1.4, 1.4, allow_nan=False),
+    st.floats(-math.pi, math.pi, allow_nan=False),
+)
+def test_sdk_tcp_round_trip(r: float, p: float, y: float) -> None:
+    sdk = [120.0, -30.0, 410.0, r, p, y]
+    back = units.tcp_pose_to_sdk(units.sdk_to_tcp_pose(sdk, gripper=True), gripper=True)
+    assert back[:3] == pytest.approx(sdk[:3], abs=1e-6)
+    q0 = units.sdk_to_pose(sdk).orientation
+    assert se3.quat_geodesic(units.sdk_to_pose(back).orientation, q0) < 1e-6
