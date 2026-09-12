@@ -13,10 +13,22 @@ thread runs ``rs.align(rs.stream.color)`` on every frameset (~2 ms/frame budget
 on the lab machine) so depth pixels index the colour image. ``depth: false``
 (the default) leaves the colour-only behaviour untouched: no depth stream, no
 align object, ``depth is None``.
+
+Recovery (2026-09-11): a capture exception (typically one ``wait_for_frames``
+timeout after a USB hiccup) no longer marks the camera ``failed`` for good. The
+capture thread stops the pipeline and starts a fresh one - plain restart first,
+``hardware_reset()`` before the second attempt, mirroring ``start()`` - re-reads the
+depth scale, re-creates ``rs.align`` and warms up again, and only gives up after
+``REOPEN_ATTEMPTS`` consecutive reopens that did not yield a frame (or whose start
+raised). ``seq`` stays monotonic across a reopen, ``latest()`` keeps the last good
+frame until a new one lands (subject to ``STALE_AFTER_S``), and ``reopen_count``
+counts the attempts for telemetry. A ``failed`` camera has released its pipeline;
+the runtime replaces it at the next ``start_previews()``.
 """
 
 from __future__ import annotations
 
+import logging
 import threading
 import time
 from typing import Any
@@ -34,6 +46,11 @@ except ImportError:  # pragma: no cover - exercised via rs_mod injection
 WARMUP_S = 1.0  # sensor needs >= 1 s before frames are usable (LeRobot)
 STALE_AFTER_S = 0.5
 DEFAULT_DEPTH_SCALE_M = 0.001  # z16 in mm — the D4xx default, used when the SDK read fails
+WAIT_TIMEOUT_MS = 1000  # wait_for_frames budget; one miss is a hiccup, not a dead camera
+REOPEN_ATTEMPTS = 2  # consecutive reopens without a frame before the camera is ``failed``
+HARDWARE_RESET_SETTLE_S = 2.0  # the D4xx re-enumerates after hardware_reset(); tests shrink it
+
+_log = logging.getLogger(__name__)
 
 
 class RealSenseCamera(CameraInterface):
@@ -54,8 +71,9 @@ class RealSenseCamera(CameraInterface):
         self._frame: CameraFrame | None = None
         self._seq = 0
         self._failed = False
-        self._align: Any = None  # rs.align(rs.stream.color), created once per start()
+        self._align: Any = None  # rs.align(rs.stream.color), created once per pipeline start
         self._depth_scale_m = DEFAULT_DEPTH_SCALE_M
+        self._reopen_count = 0
 
     @property
     def camera_id(self) -> str:
@@ -79,6 +97,13 @@ class RealSenseCamera(CameraInterface):
         depth is off or the sensor did not answer)."""
         return self._depth_scale_m
 
+    @property
+    def reopen_count(self) -> int:
+        """Pipeline reopens the capture thread has attempted after a capture
+        exception (lifetime of this object; telemetry / tests). ``failed`` says
+        whether the last burst gave up."""
+        return self._reopen_count
+
     def start(self) -> None:
         if self._running:
             return
@@ -99,6 +124,19 @@ class RealSenseCamera(CameraInterface):
                 raise CameraInitError(
                     "camera", f"{self.cfg.id}: pipeline start failed twice: {exc}"
                 ) from exc
+        self._configure_streams()
+        self._failed = False
+        self._running = True
+        self._thread = threading.Thread(
+            target=self._capture_loop, name=f"cam.{self.cfg.id}", daemon=True
+        )
+        self._thread.start()
+
+    def _configure_streams(self) -> None:
+        """Per-pipeline state after ``pipeline.start``: the depth scale (read once),
+        the ``rs.align`` object, then the sensor warm-up. Shared by ``start()`` and
+        a reopen, so a reopened pipeline publishes the same depth contract."""
+        rs = self._rs
         if self.cfg.depth:
             self._depth_scale_m = self._read_depth_scale()
             self._align = rs.align(rs.stream.color) if self.cfg.align_depth_to_color else None
@@ -107,12 +145,6 @@ class RealSenseCamera(CameraInterface):
             self._align = None
         if self._warmup_s > 0:
             time.sleep(self._warmup_s)
-        self._failed = False
-        self._running = True
-        self._thread = threading.Thread(
-            target=self._capture_loop, name=f"cam.{self.cfg.id}", daemon=True
-        )
-        self._thread.start()
 
     def _start_pipeline(self) -> Any:
         rs = self._rs
@@ -145,7 +177,7 @@ class RealSenseCamera(CameraInterface):
             for dev in ctx.query_devices():
                 if dev.get_info(rs.camera_info.serial_number) == str(self.cfg.serial):
                     dev.hardware_reset()
-                    time.sleep(2.0)
+                    time.sleep(HARDWARE_RESET_SETTLE_S)
                     return
         except Exception:  # noqa: BLE001
             pass
@@ -155,13 +187,16 @@ class RealSenseCamera(CameraInterface):
         if self._thread is not None:
             self._thread.join(timeout=1.0)
             self._thread = None
-        if self._pipeline is not None:
+        self._stop_pipeline()
+
+    def _stop_pipeline(self) -> None:
+        """Release the current pipeline (idempotent; a dead device may raise)."""
+        pipeline, self._pipeline, self._align = self._pipeline, None, None
+        if pipeline is not None:
             try:
-                self._pipeline.stop()
-            except Exception:  # noqa: BLE001
+                pipeline.stop()
+            except Exception:  # noqa: BLE001 — already stopped / device gone
                 pass
-            self._pipeline = None
-        self._align = None
 
     def latest(self) -> CameraFrame | None:
         with self._lock:
@@ -171,29 +206,42 @@ class RealSenseCamera(CameraInterface):
         return frame
 
     def _capture_loop(self) -> None:
+        failed_reopens = 0  # reopens since the last good frame (bounded by REOPEN_ATTEMPTS)
         while self._running:
-            depth_img: np.ndarray | None = None
             try:
-                frames = self._pipeline.wait_for_frames(timeout_ms=1000)
-                if self._align is not None:
-                    frames = self._align.process(frames)  # depth pixels -> colour pixels
-                color = frames.get_color_frame()
-                if not color:
-                    continue
-                rgb = np.ascontiguousarray(np.asanyarray(color.get_data()))  # RGB (rs.format.rgb8)
-                if self.cfg.depth:
-                    depth = frames.get_depth_frame()
-                    if depth:  # a frameset without depth keeps the colour frame
-                        depth_img = np.ascontiguousarray(
-                            np.asanyarray(depth.get_data()), dtype=np.uint16
+                grabbed = self._grab()
+            except Exception as exc:  # noqa: BLE001 — wait_for_frames timeout, USB hiccup
+                if not self._running:
+                    return  # stop() closed the pipeline under the wait: not a fault
+                _log.warning(
+                    "camera %s: capture failed (%s: %s); reopening the pipeline",
+                    self.cfg.id,
+                    type(exc).__name__,
+                    exc,
+                )
+                while True:
+                    if failed_reopens >= REOPEN_ATTEMPTS:
+                        _log.error(
+                            "camera %s: %d consecutive reopens produced no frame; "
+                            "marking the camera failed",
+                            self.cfg.id,
+                            failed_reopens,
                         )
-                        if depth_img.shape != rgb.shape[:2]:
-                            depth_img = None  # never publish depth that does not index rgb
-            except Exception:  # noqa: BLE001
-                self._failed = True
-                self._running = False
-                return
-            self._seq += 1
+                        self._stop_pipeline()  # release the device for the next start()
+                        self._failed = True  # UI greys the tile; never crash the workcell
+                        self._running = False
+                        return
+                    failed_reopens += 1
+                    if self._reopen(failed_reopens):
+                        break  # back to the wait; the next good frame clears the count
+                    if not self._running:
+                        return
+                continue
+            if grabbed is None:
+                continue
+            rgb, depth_img = grabbed
+            failed_reopens = 0
+            self._seq += 1  # monotonic across reopens
             frame = CameraFrame(
                 camera_id=self.cfg.id,
                 rgb=rgb,
@@ -205,6 +253,56 @@ class RealSenseCamera(CameraInterface):
             )
             with self._lock:
                 self._frame = frame
+
+    def _grab(self) -> tuple[np.ndarray, np.ndarray | None] | None:
+        """One frameset -> (rgb, depth or None); None when it carries no colour frame.
+        Raises whatever the SDK raises (the caller decides about reopening)."""
+        frames = self._pipeline.wait_for_frames(timeout_ms=WAIT_TIMEOUT_MS)
+        if self._align is not None:
+            frames = self._align.process(frames)  # depth pixels -> colour pixels
+        color = frames.get_color_frame()
+        if not color:
+            return None
+        rgb = np.ascontiguousarray(np.asanyarray(color.get_data()))  # RGB (rs.format.rgb8)
+        depth_img: np.ndarray | None = None
+        if self.cfg.depth:
+            depth = frames.get_depth_frame()
+            if depth:  # a frameset without depth keeps the colour frame
+                depth_img = np.ascontiguousarray(np.asanyarray(depth.get_data()), dtype=np.uint16)
+                if depth_img.shape != rgb.shape[:2]:
+                    depth_img = None  # never publish depth that does not index rgb
+        return rgb, depth_img
+
+    def _reopen(self, attempt: int) -> bool:
+        """Stop the wedged pipeline and start a fresh one; ``hardware_reset()`` first
+        from the second attempt on (the same escalation as ``start()``). True when
+        a pipeline is streaming again; False when its start raised or ``stop()``
+        arrived meanwhile (then nothing is left open)."""
+        self._reopen_count += 1
+        self._stop_pipeline()
+        if attempt >= 2:
+            self._hardware_reset()
+        if not self._running:
+            return False
+        try:
+            self._pipeline = self._start_pipeline()
+        except Exception as exc:  # noqa: BLE001 — surfaces as the next attempt / give-up
+            _log.warning(
+                "camera %s: reopen %d/%d failed to start the pipeline: %s",
+                self.cfg.id,
+                attempt,
+                REOPEN_ATTEMPTS,
+                exc,
+            )
+            return False
+        self._configure_streams()
+        if not self._running:  # stop() raced the restart: do not leave the device open
+            self._stop_pipeline()
+            return False
+        _log.info(
+            "camera %s: pipeline reopened (attempt %d/%d)", self.cfg.id, attempt, REOPEN_ATTEMPTS
+        )
+        return True
 
     @staticmethod
     def find_cameras(rs_mod: Any = None) -> list[dict[str, Any]]:

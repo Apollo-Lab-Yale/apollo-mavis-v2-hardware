@@ -168,9 +168,13 @@ def test_find_cameras_prefers_by_id_and_test_reads():
 class _FakeRsDevice:
     def __init__(self, serial, name):
         self._info = {"serial_number": serial, "name": name}
+        self.resets = 0
 
     def get_info(self, key):
         return self._info[key]
+
+    def hardware_reset(self):
+        self.resets += 1
 
 
 class _FakeRsContext:
@@ -259,9 +263,13 @@ class _FakeRsPipeline:
         self.started = False
         self.stopped = False
         self._seq = 0
+        self.index = len(module.pipelines)  # 0 = the pipeline start() opened, 1.. = reopens
 
     def start(self, config):
         self.config = config
+        self._m.start_attempts += 1
+        if self._m.start_raises is not None and self._m.start_raises(self):
+            raise RuntimeError("No device connected")
         self.started = True
         self._m.pipelines.append(self)
 
@@ -276,7 +284,11 @@ class _FakeRsPipeline:
         return any(st[0] == self._m.stream.depth for st in self.config.streams)
 
     def wait_for_frames(self, timeout_ms=1000):
+        if self.stopped:  # librealsense: wait after stop() raises
+            raise RuntimeError("wait_for_frames cannot be called before start()")
         self._seq += 1
+        if self._m.wait_raises is not None and self._m.wait_raises(self):
+            raise RuntimeError(f"Frame didn't arrive within {timeout_ms}")
         st = self.config.streams[0]
         w, h = st[1], st[2]
         depth = self.depth_enabled and not (
@@ -320,14 +332,25 @@ class FakeRsModule:
         depth_scale=0.001,
         depth_scale_raises=False,
         depth_frame_missing_every=0,
+        wait_raises=None,
+        start_raises=None,
     ):
         self._devices = [_FakeRsDevice(s, f"Intel RealSense D435 ({s})") for s in serials]
         self.depth_scale = depth_scale
         self.depth_scale_raises = depth_scale_raises
         self.depth_scale_reads = 0
         self.depth_frame_missing_every = depth_frame_missing_every  # 0 = never missing
-        self.pipelines: list[_FakeRsPipeline] = []
+        # Failure injection, each a ``pipeline -> bool`` (``pipeline.index``: 0 = the one
+        # start() opened, 1.. = reopens; ``pipeline._seq``: waits on that pipeline so far).
+        self.wait_raises = wait_raises  # wait_for_frames raises (a timeout / USB hiccup)
+        self.start_raises = start_raises  # pipeline.start raises (device busy / gone)
+        self.start_attempts = 0
+        self.pipelines: list[_FakeRsPipeline] = []  # started pipelines, in order
         self.aligns: list[_FakeRsAlign] = []
+
+    @property
+    def resets(self) -> int:
+        return sum(d.resets for d in self._devices)
 
     def context(self):
         return _FakeRsContext(self._devices)
@@ -484,6 +507,98 @@ def test_realsense_depth_scale_read_failure_falls_back_to_mm():
         assert rs.depth_scale_reads == 1
     finally:
         cam.stop()
+
+
+# -- RealSense bounded reopen (2026-09-11) ----------------------------------------------------
+def _wait_until(pred, timeout=2.0, what="condition"):
+    deadline = time.monotonic() + timeout
+    while not pred():
+        assert time.monotonic() < deadline, f"timed out waiting for {what}"
+        time.sleep(0.005)
+
+
+def test_realsense_wait_timeout_reopens_once_and_keeps_streaming(caplog):
+    """One wait_for_frames failure -> stop + fresh pipeline (no hardware reset), depth
+    scale re-read, align re-created, seq monotonic, ``failed`` stays False."""
+    rs = FakeRsModule([RS_SERIAL], wait_raises=lambda p: p.index == 0 and p._seq > 2)
+    cam = RealSenseCamera(_rs_cfg(depth=True), rs_mod=rs, warmup_s=0.0)
+    with caplog.at_level("WARNING", logger="apollo_mavis_v2_hardware.cameras.realsense_camera"):
+        cam.start()
+        try:
+            first = _first_frame(cam)
+            _wait_until(lambda: cam.latest() is not None and cam.latest().seq > first.seq + 2)
+            later = cam.latest()
+            assert cam.reopen_count == 1 and not cam.failed
+            assert len(rs.pipelines) == 2 and rs.pipelines[0].stopped
+            assert not rs.pipelines[1].stopped
+            assert rs.resets == 0  # the first attempt is a plain restart
+            assert later.seq > first.seq and later.depth is not None
+            assert int(later.depth[0, 0]) == _FakeRsFrameset.ALIGNED_DEPTH  # align re-created
+            assert len(rs.aligns) == 2 and rs.aligns[1].processed >= 1
+            assert rs.depth_scale_reads == 2  # re-read once per pipeline start
+            assert cam._thread is not None and cam._thread.is_alive()
+        finally:
+            cam.stop()
+    warnings = [r for r in caplog.records if r.levelno >= 30]
+    assert len(warnings) == 1 and "reopening" in warnings[0].getMessage()  # logged once
+    assert rs.pipelines[1].stopped
+
+
+def test_realsense_persistent_failure_marks_failed_after_bounded_reopens(monkeypatch):
+    """Every reopened pipeline dies at its first wait -> REOPEN_ATTEMPTS reopens (hardware
+    reset before the second), then ``failed``, pipeline released, thread gone, last good
+    frame still served."""
+    from apollo_mavis_v2_hardware.cameras import realsense_camera as rs_module
+
+    monkeypatch.setattr(rs_module, "HARDWARE_RESET_SETTLE_S", 0.0)
+    rs = FakeRsModule([RS_SERIAL], wait_raises=lambda p: p.index > 0 or p._seq > 2)
+    cam = RealSenseCamera(_rs_cfg(), rs_mod=rs, warmup_s=0.0)
+    cam.start()
+    _wait_until(lambda: cam.failed, what="failed")
+    last = cam.latest()
+    assert last is not None and last.seq == 2  # the last good frame, not None
+    assert cam.reopen_count == rs_module.REOPEN_ATTEMPTS == 2
+    assert len(rs.pipelines) == 3 and all(p.stopped for p in rs.pipelines)  # device released
+    assert rs.resets == 1  # only the second attempt hardware-resets
+    cam._thread.join(timeout=1.0)
+    assert not cam._thread.is_alive()
+    cam.stop()  # idempotent after a give-up
+    assert cam.failed and cam.reopen_count == 2
+
+
+def test_realsense_reopen_start_failure_counts_as_an_attempt(monkeypatch):
+    from apollo_mavis_v2_hardware.cameras import realsense_camera as rs_module
+
+    monkeypatch.setattr(rs_module, "HARDWARE_RESET_SETTLE_S", 0.0)
+    rs = FakeRsModule(
+        [RS_SERIAL],
+        wait_raises=lambda p: p._seq > 2,
+        start_raises=lambda p: p.index >= 1,  # every reopen's pipeline.start raises
+    )
+    cam = RealSenseCamera(_rs_cfg(), rs_mod=rs, warmup_s=0.0)
+    cam.start()
+    try:
+        _wait_until(lambda: cam.failed, what="failed")
+        assert cam.reopen_count == 2 and rs.resets == 1
+        assert rs.start_attempts == 3 and len(rs.pipelines) == 1 and rs.pipelines[0].stopped
+        assert cam.latest() is not None  # the frames from before the failure
+    finally:
+        cam.stop()
+
+
+def test_realsense_start_failure_still_raises(monkeypatch):
+    """start() keeps today's contract: plain start, hardware reset, second start,
+    CameraInitError - no capture thread, nothing marked."""
+    from apollo_mavis_v2_hardware.cameras import realsense_camera as rs_module
+
+    monkeypatch.setattr(rs_module, "HARDWARE_RESET_SETTLE_S", 0.0)
+    rs = FakeRsModule([RS_SERIAL], start_raises=lambda p: True)
+    cam = RealSenseCamera(_rs_cfg(), rs_mod=rs, warmup_s=0.0)
+    with pytest.raises(CameraInitError, match="pipeline start failed twice"):
+        cam.start()
+    assert rs.start_attempts == 2 and rs.resets == 1 and rs.pipelines == []
+    assert cam._thread is None and cam.latest() is None and cam.reopen_count == 0
+    cam.stop()  # nothing to release
 
 
 # -- USB-serial addressing (RealSense D435i colour over UVC) -----------------------------------
