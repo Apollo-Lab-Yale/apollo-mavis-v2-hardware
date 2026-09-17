@@ -133,9 +133,10 @@ def test_set_collision_sensitivity_is_one_write_with_the_apply_backstops_argumen
     assert set_collision_sensitivity(FakeXArmAPI(), 1) == []
 
 
-def test_set_collision_sensitivity_refuses_everything_but_1_2_3_before_any_call():
-    assert COLLISION_SENSITIVITY_LEVELS == frozenset({1, 2, 3})
-    for bad in (0, 4, 5, -1, 2.5, True, False, None, "2"):
+def test_set_collision_sensitivity_refuses_everything_but_0_1_2_3_before_any_call():
+    # 0 admitted 2026-09-17 (detection OFF, operator request); 4 / 5 stay out
+    assert COLLISION_SENSITIVITY_LEVELS == frozenset({0, 1, 2, 3})
+    for bad in (4, 5, -1, 2.5, True, False, None, "2"):  # 0 is admitted (2026-09-17)
         api = FakeXArmAPI()
         with pytest.raises((ValueError, TypeError)):
             set_collision_sensitivity(api, bad)  # type: ignore[arg-type]

@@ -81,7 +81,9 @@ class XArmDriverConfig(BaseModel):
     gripper: Literal["xarm", "xarm_g2", "none"] = "xarm"
     tcp_load_kg: float = 0.82  # classic gripper mass; override per tool
     tcp_load_cog_mm: tuple[float, float, float] = (0.0, 0.0, 48.0)
-    collision_sensitivity: int = Field(default=3, ge=0, le=5)  # 3..4 per overview §6
+    collision_sensitivity: int = Field(default=3, ge=1, le=5)  # 3..4 per overview §6
+    # 0 (detection OFF) is a run-time level only - apply_backstops writes THIS value at
+    # every connect, so a 0 here would make the operator's volatile override permanent
     reduced_tcp_boundary_mm: tuple[int, int, int, int, int, int] | None = None
     # optional [x_max, x_min, y_max, y_min, z_max, z_min] base-frame envelope
     # (11-safety §11); None = reduced mode off

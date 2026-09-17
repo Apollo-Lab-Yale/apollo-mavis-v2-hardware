@@ -27,7 +27,7 @@ carries the posture the sweep assumed and the op refuses, before any write,
 when the arm has moved or a controller error is latched. ``motion_enable`` is
 never part of it (the track is a separate RS-485 axis; the arm stays braked).
 ``set_collision_sensitivity`` (2026-09-11) = exactly one
-``set_collision_sensitivity(level)`` with the operator's level 1..3
+``set_collision_sensitivity(level)`` with the operator's level 0..3 (0 = OFF)
 (``backstops.set_collision_sensitivity``; the request carries ``level``, anything
 else is refused before the queue), judged from the rich-frame read-back like
 ``apply_backstops``; no motion, volatile - the next connect re-applies the
@@ -265,7 +265,7 @@ class _MaintenanceRequest:
     ``expected_q`` / ``q_tol_rad`` belong to ``home_rail``: the 7 joint angles the
     runtime's rail sweep was checked at; the op refuses before its first write when
     the before-sample deviates by more than ``q_tol_rad`` on any joint. ``level``
-    belongs to ``set_collision_sensitivity``: the operator's level (1..3, validated
+    belongs to ``set_collision_sensitivity``: the operator's level (0..3, validated
     in :meth:`ArmStateMonitor.maintenance`)."""
 
     __slots__ = (
@@ -468,7 +468,7 @@ class ArmStateMonitor:
         ``set_linear_track_speed(cfg.rail_speed_mm_s)``; ``ok`` is judged from the
         after-sample registers only (``on_zero == 1``, ``is_enabled == 1``,
         ``error == 0``), never from the SDK return codes (module docstring).
-        ``set_collision_sensitivity`` (2026-09-11): needs ``level`` in 1..3 (refused
+        ``set_collision_sensitivity`` (2026-09-11): needs ``level`` in 0..3 (refused
         with ``ok=False`` otherwise, nothing queued); writes exactly
         ``set_collision_sensitivity(level, wait=False)``, waits up to
         ``BACKSTOP_READBACK_SETTLE_S`` for the rich frame to echo it, and is ``ok``
@@ -499,9 +499,9 @@ class ArmStateMonitor:
             ):
                 return self._refuse(
                     op,
-                    "set_collision_sensitivity needs a level of 1, 2 or 3 "
-                    f"(got {level!r}); 0 turns detection off and 4 / 5 false-trigger "
-                    "under payload",
+                    "set_collision_sensitivity needs a level of 0, 1, 2 or 3 "
+                    f"(got {level!r}); 0 turns collision detection OFF and 4 / 5 "
+                    "false-trigger under payload",
                 )
             level = int(level)
         expected: tuple[float, ...] | None = None

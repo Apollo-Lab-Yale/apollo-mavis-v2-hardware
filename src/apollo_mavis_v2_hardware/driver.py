@@ -1301,9 +1301,9 @@ class XArmDriver(ArmInterface):
         driver's own phase / budget / streamer are untouched. Volatile: the next
         connect's ``apply_backstops`` restores ``cfg.collision_sensitivity``."""
         self._check_writable()
-        if isinstance(level, bool) or int(level) != level or int(level) not in (1, 2, 3):
+        if isinstance(level, bool) or int(level) != level or int(level) not in (0, 1, 2, 3):
             raise CommandError(
-                f"{self.cfg.arm_id}: collision sensitivity must be 1, 2 or 3 (got {level!r})"
+                f"{self.cfg.arm_id}: collision sensitivity must be 0, 1, 2 or 3 (got {level!r})"
             )
         if self._api is None or self._monitor is None:
             raise CommandError(f"{self.cfg.arm_id}: driver not connected")

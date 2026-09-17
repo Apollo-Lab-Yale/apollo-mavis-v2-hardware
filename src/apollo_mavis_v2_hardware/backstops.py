@@ -11,7 +11,7 @@ lets the session-less read-only monitor apply them on an explicit operator
 request (``ArmStateMonitor.maintenance("apply_backstops", cfg)``).
 
 :func:`set_collision_sensitivity` (2026-09-11) is the operator's level override -
-ONE ``set_collision_sensitivity(level)`` write, 1..3 only - shared by the
+ONE ``set_collision_sensitivity(level)`` write, 0..3 (0 = OFF) - shared by the
 monitor's ``set_collision_sensitivity`` maintenance op (session-less) and the
 driver's ``request_set_collision_sensitivity`` channel (inside a session). It
 is as volatile as the rest: the next connect's :func:`apply_backstops` puts
@@ -44,7 +44,13 @@ STATUS_ECHO_CODES: frozenset[int] = frozenset({1, 2, 9})
 
 # The operator's admissible collision-sensitivity levels (operator decision 2026-09-11):
 # 0 = detection off, 4 / 5 false-trigger under payload - both refused everywhere.
-COLLISION_SENSITIVITY_LEVELS: frozenset[int] = frozenset({1, 2, 3})
+COLLISION_SENSITIVITY_LEVELS: frozenset[int] = frozenset({0, 1, 2, 3})
+# The operator's admissible range. 0 = the controller's collision detection OFF, admitted
+# 2026-09-17 at the operator's request: a fridge door's magnetic seal and hinge torque read
+# as a collision at every non-zero level, so such a task is impossible with detection on.
+# It is safe to expose because the level is VOLATILE - ``apply_backstops`` writes
+# ``cfg.collision_sensitivity`` (3 on both lab arms) at EVERY connect, so 0 cannot outlive
+# the driver connection that set it. 4 / 5 stay out: they false-trigger under payload.
 
 # set_collision_tool_model tool types (SDK doc)
 TOOL_MODEL_NONE = 0
@@ -106,7 +112,7 @@ def set_collision_sensitivity(
     ``api.set_collision_sensitivity(level, wait=False)`` - the same call and
     arguments as step (2) of :func:`apply_backstops`, with the operator's level
     instead of ``cfg.collision_sensitivity``. ``level`` must be in
-    :data:`COLLISION_SENSITIVITY_LEVELS` (1..3; ``ValueError`` otherwise - the
+    :data:`COLLISION_SENSITIVITY_LEVELS` (0..3, 0 = OFF; ``ValueError`` otherwise - the
     monitor and the driver refuse before getting here). ``codes`` receives the
     return code under ``"set_collision_sensitivity"``; a non-zero code comes back
     as the one warning string (a status echo 1 / 2 / 9 included - the caller

@@ -779,8 +779,9 @@ def test_maintenance_refusals_never_touch_the_sdk() -> None:
     )
     assert set(MAINTENANCE_SDK_METHODS) == set(MAINTENANCE_OPS)
     assert MAINTENANCE_SDK_METHODS["set_collision_sensitivity"] == {"set_collision_sensitivity"}
-    # set_collision_sensitivity needs a level of 1..3, refused (not raised) otherwise
-    for bad in (None, 0, 4, 5, 2.5, True, "2"):
+    # set_collision_sensitivity needs a level of 0..3, refused (not raised) otherwise
+    # (0 = detection OFF, admitted 2026-09-17 at the operator's request)
+    for bad in (None, 4, 5, 2.5, True, "2"):
         out = mon.maintenance("set_collision_sensitivity", level=bad, timeout_s=0.5)  # type: ignore[arg-type]
         assert not out.ok and out.detail.startswith("set_collision_sensitivity needs a level")
     # not started: off
@@ -1510,11 +1511,11 @@ def test_maintenance_set_collision_sensitivity_refusals_never_touch_the_sdk():
         mon.start()
         wait_sample(mon)
         raw = h["raw"]
-        for bad in (None, 0, 4, 5):
+        for bad in (None, 4, 5):  # 0 is admitted since 2026-09-17 (detection OFF)
             out = mon.maintenance("set_collision_sensitivity", timeout_s=0.5, level=bad)
             assert not out.ok
             assert out.detail.startswith(
-                f"set_collision_sensitivity needs a level of 1, 2 or 3 (got {bad!r})"
+                f"set_collision_sensitivity needs a level of 0, 1, 2 or 3 (got {bad!r})"
             )
         mon.disconnect()  # hand-over
         out = mon.maintenance("set_collision_sensitivity", timeout_s=0.5, level=2)

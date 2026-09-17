@@ -662,7 +662,7 @@ def test_request_set_collision_sensitivity_refuses_bad_levels_and_needs_a_connec
     drv, h = make_driver()
     api = h["api"]
     try:
-        for bad in (0, 4, 5, -1, 2.5, True, "2"):
+        for bad in (4, 5, -1, 2.5, True, "2"):  # 0 is admitted (2026-09-17)
             with pytest.raises(CommandError):
                 drv.request_set_collision_sensitivity(bad)  # type: ignore[arg-type]
         time.sleep(0.05)
